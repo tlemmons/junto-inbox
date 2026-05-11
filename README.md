@@ -50,8 +50,9 @@ fallback was removed in v0.0.15):
   (set once, persists across sessions).
 - `JUNTO_SHARED_MEMORY_URL` (default `http://localhost:8080/mcp`) — point this at wherever your shared-memory MCP server is reachable.
 - `JUNTO_API_KEY` (only if shared-memory has `MCP_AUTH_ENABLED=true`)
-- `JUNTO_AUTOPILOT_ENABLE`, `JUNTO_AUTOPILOT_DEPTH_CAP`, `JUNTO_AUTOPILOT_BUDGET`
-  — opt-in autopilot configuration applied at bind time.
+- `JUNTO_AUTOPILOT_ENABLE`, `JUNTO_AUTOPILOT_DEPTH_CAP` (default 5),
+  `JUNTO_AUTOPILOT_BUDGET` (default 30) — opt-in autopilot configuration
+  applied at bind time.
 - `JUNTO_DEBUG=1` — write per-event traces to `./junto-inbox-debug.log`.
 
 ## Launch

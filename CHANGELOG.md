@@ -3,6 +3,18 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.17
+
+- **Loosen session-bind autopilot defaults** from `depth_cap=1, budget=10` to
+  `depth_cap=5, budget=30`. Coordinated with the junto-memory gate-ordering fix
+  (memory commit `1e5b095`): once that fix is deployed, budget-breach actually
+  triggers auto-disable. The old tight defaults would false-pause busy
+  human-driven sessions because Bug B (autopilot counter ticks even on
+  `human_interacted=true` traffic) is still open. `depth_cap=5` sits at the
+  system `CHAIN_DEPTH_HARD_CAP`; Phase D2 recency_bypass remains in force after
+  any human interaction. Override knobs unchanged:
+  `JUNTO_AUTOPILOT_DEPTH_CAP`, `JUNTO_AUTOPILOT_BUDGET`.
+
 ## v0.0.16
 
 - **Heal stale `session_id` across host `/clear + go` cycles.** The plugin's

@@ -7,6 +7,18 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.17 — loosens session-bind autopilot defaults from depth_cap=1, budget=10
+ *          to depth_cap=5, budget=30. Coordinated with junto-memory's
+ *          gate-ordering fix (commit 1e5b095): once that fix deploys,
+ *          budget-breach actually triggers auto-disable, so the prior
+ *          tight defaults would false-pause busy human-driven sessions
+ *          where every reply is human_interacted=true (Bug B, backlog
+ *          ae420dedf280, still open — counter currently ticks regardless
+ *          of human_interacted). depth_cap=5 sits at the system
+ *          CHAIN_DEPTH_HARD_CAP, with Phase D2 recency_bypass still in
+ *          force; Tom's call, "team is working together well." Knobs
+ *          unchanged: JUNTO_AUTOPILOT_DEPTH_CAP, JUNTO_AUTOPILOT_BUDGET
+ *          override the new defaults.
  * v0.0.16 — fixes stale-session-id survival across /clear + go (backlog_ebee2551b430).
  *          The plugin's session_id was effectively pinned for the plugin
  *          process lifetime; the v0.0.11 30s heartbeat detected death but
@@ -91,6 +103,7 @@
  *          for (project, agent) right after session establishment so chain
  *          replies (depth>=1) flow without manual config. Knobs:
  *          CT_AUTOPILOT_DEPTH_CAP (default 1), CT_AUTOPILOT_BUDGET (default 10).
+ *          (Defaults raised to 5/30 in v0.0.17.)
  *          Idempotent: re-applies on every reconnect. Server-side budget
  *          breach can still flip enabled=false; that flip persists until the
  *          next plugin reconnect re-applies the env-driven config.
@@ -163,8 +176,8 @@ const AGENT = envVar('AGENT')
 const API_KEY = envVar('API_KEY') ?? null
 const ROLE = envVar('ROLE') ?? null
 const AUTOPILOT_ENABLE = envVar('AUTOPILOT_ENABLE') === '1' || envVar('AUTOPILOT_ENABLE') === 'true'
-const AUTOPILOT_DEPTH_CAP = Number(envVar('AUTOPILOT_DEPTH_CAP') ?? 1)
-const AUTOPILOT_BUDGET = Number(envVar('AUTOPILOT_BUDGET') ?? 10)
+const AUTOPILOT_DEPTH_CAP = Number(envVar('AUTOPILOT_DEPTH_CAP') ?? 5)
+const AUTOPILOT_BUDGET = Number(envVar('AUTOPILOT_BUDGET') ?? 30)
 
 if (!PROJECT || !AGENT) {
   process.stderr.write('junto-inbox: JUNTO_PROJECT and JUNTO_AGENT must be set\n')

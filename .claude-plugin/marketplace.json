@@ -1,0 +1,16 @@
+{
+  "name": "tlemmons-junto-inbox",
+  "owner": {
+    "name": "Tom Lemmons",
+    "url": "https://github.com/tlemmons"
+  },
+  "plugins": [
+    {
+      "name": "junto-inbox",
+      "source": {
+        "type": "github",
+        "repo": "tlemmons/junto-inbox"
+      }
+    }
+  ]
+}

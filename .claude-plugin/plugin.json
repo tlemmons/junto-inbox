@@ -1,0 +1,22 @@
+{
+  "name": "junto-inbox",
+  "version": "0.0.17",
+  "description": "Channel plugin that forwards messages from a junto-memory MCP server into Claude Code via the Channels research preview. Enables multi-agent coordination across Claude Code sessions.",
+  "author": {
+    "name": "Tom Lemmons",
+    "url": "https://github.com/tlemmons"
+  },
+  "homepage": "https://github.com/tlemmons/junto-inbox",
+  "repository": "https://github.com/tlemmons/junto-inbox",
+  "license": "MIT",
+  "keywords": ["channels", "messaging", "mcp", "multi-agent", "junto"],
+  "mcpServers": {
+    "junto-inbox": {
+      "command": "bun",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server.ts"]
+    }
+  },
+  "channels": [
+    { "server": "junto-inbox" }
+  ]
+}

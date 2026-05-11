@@ -10,29 +10,17 @@ B reads it without anyone manually walking to B's terminal.
 
 ## Status
 
-v0.0.16 — fixes a stale-session-id survival bug across host `/clear + go`
-cycles. The plugin's session_id was effectively pinned for the plugin
-process lifetime; the v0.0.11 30s heartbeat detected death but left a
-window where a new persona's `go` macro called `get_session_id` between
-heartbeat ticks and got the stale ID back. `get_session_id` now fires
-`memory_heartbeat` inline as a liveness check, and `send_message` now
-inspects `isError` on the response — both paths null `sessionId`,
-trigger supervisor reconnect, and surface the error so the caller falls
-back per the host CC's CLAUDE.md retry contract.
+v0.0.17 — loosens session-bind autopilot defaults from `depth_cap=1,
+budget=10` to `depth_cap=5, budget=30`. Override knobs unchanged
+(`JUNTO_AUTOPILOT_DEPTH_CAP`, `JUNTO_AUTOPILOT_BUDGET`). See
+[CHANGELOG.md](CHANGELOG.md) for full history including v0.0.16
+(stale-session-id healing across `/clear + go`) and earlier.
 
-v0.0.15 — drops the v0.0.14 `CT_*` env-var deprecation fallback. Adds
-`human_interacted: boolean` to the `send_message` tool input schema and
-passes it through to `memory_send_message` (sender-asserted; the server
-uses it to reset effective_chain_depth=0 on autopilot replies that followed
-a human prompt). Adds `memory_autopilot_count` poll on each 30s heartbeat
-and writes the snapshot into the status file so `statusline.ts` renders a
-`current/budget` indicator next to the dot.
-
-Otherwise functionally identical to v0.0.13/v0.0.14: subscribe-mode against
-`inbox://<project>/<agent>`, client-side `memory_autopilot_check_budget` gate
-for `chain_depth >= 1`, `get_session_id` tool for host-CC session sharing,
-paginated inbox drain, status file for statusLine indicator,
-`[REQUIRES REVIEW]` marker for messages tagged `require_human=true`.
+Functionally: subscribe-mode against `inbox://<project>/<agent>`,
+client-side `memory_autopilot_check_budget` gate for `chain_depth >= 1`,
+`get_session_id` tool for host-CC session sharing, paginated inbox drain,
+status file for statusLine indicator, `[REQUIRES REVIEW]` marker for
+messages tagged `require_human=true`.
 
 Auth-bound: the agent identifier passed to `memory_start_session` MUST equal the
 URI's `<agent>` segment, otherwise subscribe raises and reads return
@@ -55,12 +43,27 @@ fallback was removed in v0.0.15):
   applied at bind time.
 - `JUNTO_DEBUG=1` — write per-event traces to `./junto-inbox-debug.log`.
 
-## Launch
+## Install
 
-Run `claude` from inside this directory (the `.mcp.json` here registers
-`junto-inbox` as a spawnable stdio server).
+### Recommended: from the bundled marketplace
 
-During research preview, before Anthropic-allowlisting:
+The repo ships `.claude-plugin/marketplace.json` so you can install with
+two `/plugin` slash-commands inside Claude Code:
+
+```
+/plugin marketplace add tlemmons/junto-inbox
+/plugin install junto-inbox@tlemmons-junto-inbox
+```
+
+Marketplace install gives you persistent trust (`hasTrustDialogAccepted`
+in `~/.claude.json`); no per-launch confirmation dialog.
+
+### Development: clone and run via stdio
+
+Clone the repo and run `claude` from inside the checkout (the bundled
+`.mcp.json` registers `junto-inbox` as a spawnable stdio server). This
+path requires confirming the `--dangerously-load-development-channels`
+dialog on every launch.
 
 **bash / zsh:**
 ```bash
@@ -79,16 +82,16 @@ $env:JUNTO_PROJECT="nimbus"; $env:JUNTO_AGENT="server-team"; `
 set JUNTO_PROJECT=nimbus && set JUNTO_AGENT=server-team && claude --dangerously-load-development-channels server:junto-inbox
 ```
 
-If the plugin process exits without registering an agent (check
-`memory_list_agents`), CC swallows the stderr — look at
-`~/.claude/debug/<session-id>.txt` for the actual failure.
-
-Once allowlisted:
+## Launch (after install)
 
 ```
 JUNTO_PROJECT=nimbus JUNTO_AGENT=server-team \
-  claude --channels plugin:junto-inbox@anthropic-claude-plugins-official
+  claude --channels plugin:junto-inbox@tlemmons-junto-inbox
 ```
+
+If the plugin process exits without registering an agent (check
+`memory_list_agents`), CC swallows the stderr — look at
+`~/.claude/debug/<session-id>.txt` for the actual failure.
 
 ## Architecture
 
@@ -150,4 +153,4 @@ with hyphens are also silently dropped; use snake_case only.
 
 ## License
 
-MIT — see [LICENSE](../../LICENSE) at the repo root.
+MIT — see [LICENSE](https://github.com/tlemmons/junto-inbox/blob/main/LICENSE).

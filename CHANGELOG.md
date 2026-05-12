@@ -3,6 +3,23 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.18
+
+- **Persistent outbox for offline `send_message`.** When the shared-memory link
+  is down (VPN drop, server restart, transport error mid-call), `send_message`
+  now writes the request to
+  `~/.claude/junto-inbox/<project>-<agent>.outbox.jsonl` and returns
+  `{queued:true, queue_id, queue_position, note}` to the caller instead of
+  erroring. The supervisor drains the outbox in FIFO order on every successful
+  bind, before the inbox-forward step. Capped at 1000 entries; over-cap
+  enqueues return `isError`. Transport-level failures mid-drain stop the drain
+  and leave remaining items for the next reconnect; server-side `isError`
+  responses (other than stale session) drop the offending entry and continue.
+  Stale-session detection on a live `send_message` now also queues the message
+  rather than dropping it on the floor. Original use case: work machines that
+  reach junto-memory over a flaky VPN — previously a `send_message` during a
+  VPN drop was lost to the void.
+
 ## v0.0.17
 
 - **Loosen session-bind autopilot defaults** from `depth_cap=1, budget=10` to

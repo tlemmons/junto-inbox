@@ -7,6 +7,19 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.18 — persistent outbox for offline send_message. When the shared-memory
+ *          link is down (VPN drop, server restart, transport error mid-call),
+ *          send_message now writes the request to
+ *          ~/.claude/junto-inbox/<project>-<agent>.outbox.jsonl and returns
+ *          {queued:true, queue_id, queue_position} to the caller instead of
+ *          erroring. The supervisor drains the outbox in order on every
+ *          successful bind, before the inbox-forward step. Capped at 1000
+ *          entries; over-cap enqueues return isError. Transport-level failures
+ *          mid-drain stop the drain and leave remaining items for the next
+ *          reconnect; server-side isError responses (other than stale session)
+ *          drop the offending entry and continue. Original use case: work
+ *          machines that reach junto-memory over a flaky VPN — previously a
+ *          send_message during a VPN drop was lost to the void.
  * v0.0.17 — loosens session-bind autopilot defaults from depth_cap=1, budget=10
  *          to depth_cap=5, budget=30. Coordinated with junto-memory's
  *          gate-ordering fix (commit 1e5b095): once that fix deploys,
@@ -141,7 +154,7 @@ import {
   CallToolRequestSchema,
   ResourceUpdatedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { appendFileSync, mkdirSync, writeFileSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
@@ -188,6 +201,8 @@ if (!PROJECT || !AGENT) {
 const INBOX_URI = `inbox://${PROJECT}/${AGENT}`
 const STATUS_DIR = join(homedir(), '.claude', 'junto-inbox')
 const STATUS_FILE = join(STATUS_DIR, `${PROJECT}-${AGENT}.status`)
+const OUTBOX_FILE = join(STATUS_DIR, `${PROJECT}-${AGENT}.outbox.jsonl`)
+const OUTBOX_CAP = 1000
 let statusDirCreated = false
 
 type PluginStatus = 'connected' | 'reconnecting' | 'shutdown'
@@ -210,6 +225,119 @@ function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}):
     writeFileSync(STATUS_FILE, payload)
   } catch {
     // best-effort — never let a status-file write crash the supervisor
+  }
+}
+
+// Persistent outbox for offline send_message. Entries are
+// memory_send_message arg blobs (sans session_id, which is rebound per
+// reconnect). Drained FIFO on every successful bindAndSubscribe before the
+// inbox-forward step.
+type QueuedSend = {
+  queue_id: string
+  queued_at: string
+  args: Record<string, unknown>
+}
+
+let outbox: QueuedSend[] = []
+let isDraining = false
+
+function loadOutbox(): void {
+  try {
+    if (!existsSync(OUTBOX_FILE)) return
+    const raw = readFileSync(OUTBOX_FILE, 'utf8')
+    outbox = raw
+      .split('\n')
+      .filter(line => line.trim().length > 0)
+      .map(line => {
+        try {
+          return JSON.parse(line) as QueuedSend
+        } catch {
+          return null
+        }
+      })
+      .filter((x): x is QueuedSend => x !== null)
+    if (outbox.length > 0) {
+      process.stderr.write(`junto-inbox: loaded ${outbox.length} queued outbound message(s) from outbox\n`)
+      debugLog(`loadOutbox: ${outbox.length} entries`)
+    }
+  } catch (err) {
+    debugLog(`loadOutbox: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+function persistOutbox(): void {
+  try {
+    if (!statusDirCreated) {
+      mkdirSync(STATUS_DIR, { recursive: true })
+      statusDirCreated = true
+    }
+    const body = outbox.length === 0 ? '' : outbox.map(q => JSON.stringify(q)).join('\n') + '\n'
+    writeFileSync(OUTBOX_FILE, body)
+  } catch (err) {
+    debugLog(`persistOutbox: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+function enqueueOutbox(args: Record<string, unknown>): { queue_id: string; queue_position: number } | null {
+  if (outbox.length >= OUTBOX_CAP) {
+    process.stderr.write(`junto-inbox: outbox at cap (${OUTBOX_CAP}); refusing to queue\n`)
+    return null
+  }
+  const queue_id = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+  const entry: QueuedSend = { queue_id, queued_at: new Date().toISOString(), args }
+  outbox.push(entry)
+  persistOutbox()
+  debugLog(`enqueueOutbox: ${queue_id} pos=${outbox.length}`)
+  return { queue_id, queue_position: outbox.length }
+}
+
+async function drainOutbox(): Promise<void> {
+  if (isDraining || outbox.length === 0 || !sm || !sessionId) return
+  isDraining = true
+  const total = outbox.length
+  let drained = 0
+  let dropped = 0
+  try {
+    process.stderr.write(`junto-inbox: draining outbox (${total} message(s))\n`)
+    debugLog(`drainOutbox: start total=${total}`)
+    while (outbox.length > 0) {
+      if (!sm || !sessionId) break
+      const head = outbox[0]
+      try {
+        const result = await sm.callTool({
+          name: 'memory_send_message',
+          arguments: { session_id: sessionId, ...head.args },
+        })
+        if (result.isError === true) {
+          const content = result.content as Array<{ type: string; text?: string }> | undefined
+          const text = content?.find(c => c.type === 'text')?.text ?? ''
+          if (/session.*not.*found/i.test(text)) {
+            // Leave head in place; supervisor will rebind and try again.
+            forceReconnect(`drainOutbox saw stale session_id (${text})`)
+            break
+          }
+          // Other server-side rejection (malformed args, missing parent, etc).
+          // Retrying won't help — drop the entry and continue.
+          process.stderr.write(`junto-inbox: dropping outbox entry ${head.queue_id}: ${text}\n`)
+          debugLog(`drainOutbox: drop ${head.queue_id} reason="${text}"`)
+          outbox.shift()
+          persistOutbox()
+          dropped++
+          continue
+        }
+        outbox.shift()
+        persistOutbox()
+        drained++
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err)
+        process.stderr.write(`junto-inbox: drainOutbox interrupted (${m}); will retry on next reconnect\n`)
+        debugLog(`drainOutbox: transport error ${m}`)
+        break
+      }
+    }
+  } finally {
+    isDraining = false
+    debugLog(`drainOutbox: end drained=${drained} dropped=${dropped} remaining=${outbox.length}`)
   }
 }
 
@@ -259,7 +387,7 @@ async function callMemory(name: string, args: Record<string, unknown>) {
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.16' },
+  { name: 'junto-inbox', version: '0.0.18' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -346,13 +474,40 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   if (req.params.name !== 'send_message') {
     return { content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }], isError: true }
   }
-  if (!sessionId || !sm) {
-    return { content: [{ type: 'text', text: 'send_message: shared-memory session not yet established' }], isError: true }
-  }
   // If the agent skipped get_session_id (fell back to memory_start_session),
   // a send_message tool call still proves they're live. Treat it as ready.
   markReady('send_message')
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  const sendArgs: Record<string, unknown> = {
+    to_instance: args.to_agent as string,
+    message: args.body as string,
+    to_project: (args.to_project as string | undefined) ?? PROJECT,
+    in_response_to: args.in_response_to as string | undefined,
+    require_human: args.require_human as boolean | undefined,
+    human_interacted: args.human_interacted as boolean | undefined,
+    priority: (args.priority as string | undefined) ?? 'normal',
+    category: (args.category as string | undefined) ?? 'info',
+  }
+
+  // Link known-down → queue. Supervisor's drainOutbox will deliver on reconnect.
+  if (!sessionId || !sm) {
+    const q = enqueueOutbox(sendArgs)
+    if (!q) {
+      return { content: [{ type: 'text', text: `send_message: outbox at capacity (${OUTBOX_CAP}); message rejected` }], isError: true }
+    }
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          queued: true,
+          queue_id: q.queue_id,
+          queue_position: q.queue_position,
+          note: 'shared-memory link is down; message will be delivered on reconnect',
+        }),
+      }],
+    }
+  }
+
   try {
     // Direct callTool (not callMemory) so we can inspect isError. A
     // server-side "Session not found" comes back as isError=true and was
@@ -360,33 +515,53 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     // the error to the caller as if it were the send result.
     const result = await sm.callTool({
       name: 'memory_send_message',
-      arguments: {
-        session_id: sessionId,
-        to_instance: args.to_agent as string,
-        message: args.body as string,
-        to_project: (args.to_project as string | undefined) ?? PROJECT,
-        in_response_to: args.in_response_to as string | undefined,
-        require_human: args.require_human as boolean | undefined,
-        human_interacted: args.human_interacted as boolean | undefined,
-        priority: (args.priority as string | undefined) ?? 'normal',
-        category: (args.category as string | undefined) ?? 'info',
-      },
+      arguments: { session_id: sessionId, ...sendArgs },
     })
     const content = result.content as Array<{ type: string; text?: string }> | undefined
     const text = content?.find(c => c.type === 'text')?.text ?? ''
     if (result.isError === true) {
-      // Detect the specific "session is dead" signature; on match, drop
-      // our cached id and force reconnect so the next send picks up the
-      // freshly bound session. Other errors pass through unchanged.
+      // Stale session — null id, kick supervisor, AND queue the message so
+      // it actually goes out once the rebind completes. Prior versions
+      // dropped the message on the floor here.
       if (/session.*not.*found/i.test(text)) {
         forceReconnect(`send_message saw stale session_id (${text})`)
+        const q = enqueueOutbox(sendArgs)
+        if (q) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                queued: true,
+                queue_id: q.queue_id,
+                queue_position: q.queue_position,
+                note: 'session was stale; message queued and will be delivered on reconnect',
+              }),
+            }],
+          }
+        }
       }
       return { content: [{ type: 'text', text: `send_message: ${text}` }], isError: true }
     }
     return { content: [{ type: 'text', text }] }
   } catch (err) {
+    // Transport-level failure (VPN dropped mid-call). Queue rather than lose.
     const m = err instanceof Error ? err.message : String(err)
-    return { content: [{ type: 'text', text: `send_message: ${m}` }], isError: true }
+    const q = enqueueOutbox(sendArgs)
+    forceReconnect(`send_message transport error (${m})`)
+    if (!q) {
+      return { content: [{ type: 'text', text: `send_message: ${m} (outbox at capacity; message lost)` }], isError: true }
+    }
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          queued: true,
+          queue_id: q.queue_id,
+          queue_position: q.queue_position,
+          note: `transport error (${m}); message queued and will be delivered on reconnect`,
+        }),
+      }],
+    }
   }
 })
 
@@ -587,7 +762,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.16' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.18' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })
@@ -628,6 +803,7 @@ async function bindAndSubscribe(): Promise<void> {
   debugLog(`bindAndSubscribe: connected session=${sessionId} sub=${INBOX_URI}`)
   writeStatus('connected', { source: 'bind' })
 
+  await drainOutbox()
   await readInboxAndForward()
 }
 
@@ -676,6 +852,7 @@ async function shutdown(reason: string) {
 process.on('SIGINT', () => void shutdown('SIGINT'))
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
 
+loadOutbox()
 await mcp.connect(new StdioServerTransport())
 void supervisor()
 process.stderr.write(`junto-inbox: subscribe-mode for ${PROJECT}/${AGENT}\n`)

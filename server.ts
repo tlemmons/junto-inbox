@@ -247,15 +247,15 @@ function loadOutbox(): void {
     const raw = readFileSync(OUTBOX_FILE, 'utf8')
     outbox = raw
       .split('\n')
-      .filter(line => line.trim().length > 0)
-      .map(line => {
+      .filter((line: string) => line.trim().length > 0)
+      .map((line: string) => {
         try {
           return JSON.parse(line) as QueuedSend
         } catch {
           return null
         }
       })
-      .filter((x): x is QueuedSend => x !== null)
+      .filter((x: QueuedSend | null): x is QueuedSend => x !== null)
     if (outbox.length > 0) {
       process.stderr.write(`junto-inbox: loaded ${outbox.length} queued outbound message(s) from outbox\n`)
       debugLog(`loadOutbox: ${outbox.length} entries`)

@@ -7,6 +7,36 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.20 — Phase 0 capture mechanism per design:local-first-junto-v0-mvp v0.3.0
+ *          §8: CC PreToolUse hook (hook.ts) captures the 13-tool mutation set
+ *          (memory_record_learning, _store, _define_spec, _register_function,
+ *          _enrich_function, _add_backlog_item, _batch_backlog, _update_backlog_item,
+ *          _complete_backlog_item, _change_status, _archive_by_tag, _restore_by_tag,
+ *          plus _send_message which the plugin already handled) when the
+ *          plugin status file reports health_state="offline". Hook is no-op
+ *          when online; falls back to a graceful-degradation regime (heartbeat
+ *          + send_message journal only) when not configured per-agent in
+ *          .claude/settings.json. Three coordinated additions in this server:
+ *          (1) shared schema module (schema.ts) holds CAPTURE_SET, DENY_LIST,
+ *          TOOL_OP_TYPE_MAP, JournalEntry v1 type, and path/factory helpers;
+ *          imported by both server.ts and hook.ts so they cannot drift.
+ *          (2) Journal entry schema finalized at v1 (queue_id, queued_at,
+ *          intent_id, tool_name, args sans session_id, actor{project,agent},
+ *          op_type per §4.1 catalog, schema_version=1). loadJournal upgrades
+ *          legacy v0.0.18/v0.0.19 entries on read — back-derives tool_name
+ *          for send_message-only legacy case, fills missing intent_id/actor/
+ *          schema_version, normalizes op_type to its §4.1 value. drainJournal
+ *          now threads __intent_id back to the server on replay so the
+ *          (Phase 1) op-log can dedupe across crash/retry windows per §4.6.
+ *          (3) Three new tools — junto_journal_list (read; reloads from disk
+ *          to pick up hook writes), junto_journal_replay(queue_id) (replays
+ *          one entry through the bound session with __intent_id; success ->
+ *          removes), junto_journal_discard(queue_id) (removes without replay).
+ *          Operator-review surface for the 12 non-send_message captures;
+ *          send_message still auto-drains. Coverage boundary: with hook NOT
+ *          configured, only memory_send_message is journaled — the other 12
+ *          tools fall through to the live MCP path and may silently succeed.
+ *          README + sample .claude/settings.json document the hook wiring.
  * v0.0.19 — Phase 0 of design:local-first-junto-v0-mvp. Three additions on top
  *          of v0.0.18: (1) sessionless health poller calling memory_health
  *          every 12s; after 3 consecutive failures (~45s window), declares
@@ -178,9 +208,19 @@ import {
   CallToolRequestSchema,
   ResourceUpdatedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
-import { join } from 'path'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { join, dirname } from 'path'
 import { homedir } from 'os'
+import {
+  CAPTURE_SET,
+  JournalEntry,
+  SEND_MESSAGE_TOOL,
+  TOOL_OP_TYPE_MAP,
+  journalFilePath,
+  makeJournalEntry,
+  normalizeLegacyEntry,
+  statusFilePath,
+} from './schema.ts'
 
 function envVar(name: string): string | undefined {
   const v = process.env[`JUNTO_${name}`]
@@ -223,14 +263,15 @@ if (!PROJECT || !AGENT) {
 }
 
 const INBOX_URI = `inbox://${PROJECT}/${AGENT}`
-const STATUS_DIR = join(homedir(), '.claude', 'junto-inbox')
-const STATUS_FILE = join(STATUS_DIR, `${PROJECT}-${AGENT}.status`)
-const JOURNAL_DIR = join(homedir(), '.junto', 'journal')
-const JOURNAL_FILE = join(JOURNAL_DIR, `${PROJECT}-${AGENT}.journal.jsonl`)
+const STATUS_FILE = statusFilePath(PROJECT, AGENT)
+const STATUS_DIR = dirname(STATUS_FILE)
+const JOURNAL_FILE = journalFilePath(PROJECT, AGENT)
+const JOURNAL_DIR = dirname(JOURNAL_FILE)
 const LEGACY_OUTBOX_FILE = join(STATUS_DIR, `${PROJECT}-${AGENT}.outbox.jsonl`)
 const JOURNAL_CAP = 1000
 const HEALTH_INTERVAL_MS = 12_000
 const OFFLINE_FAIL_THRESHOLD = 3
+const ACTOR = { project: PROJECT, agent: AGENT }
 let statusDirCreated = false
 let journalDirCreated = false
 
@@ -259,21 +300,19 @@ function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}):
   }
 }
 
-// Persistent journal for offline mutation tool calls. v0.0.19 expands the
-// v0.0.18 send_message-only outbox into a journal scaffolded for additional
-// op_types; the capture-mechanism for the other 12 tools listed in memory's
-// Phase 0 spec (proxy vs PreToolUse hook) is unresolved, so this version
-// still only enqueues send_message. Format change: each entry now carries
-// op_type; legacy entries (v0.0.18, no op_type) default to "send_message"
-// on load. File path moved from STATUS_DIR (Claude-Code-local) to
-// ~/.junto/journal (Junto-namespaced) per memory's design coordination.
-type JournalEntry = {
-  queue_id: string
-  queued_at: string
-  op_type: string
-  args: Record<string, unknown>
-}
-
+// Persistent journal for offline mutation tool calls. v0.0.20 finalizes the
+// schema at v1 per design:local-first-junto-v0-mvp §8: each entry carries
+// queue_id, queued_at, intent_id, tool_name (full mcp__shared-memory__...
+// name), args (session_id stripped), actor {project, agent}, op_type (§4.1
+// catalog value), and schema_version. Three populations of writers now:
+//   1. send_message tool handler (this file) — when the bound session is
+//      down OR a transport error fires mid-call. Capture target since v0.0.18.
+//   2. PreToolUse hook script (hook.ts) — when the plugin is OFFLINE per the
+//      health poller. Captures the 13-tool capture-set. New in v0.0.20.
+//   3. (Phase 1) on-server failure response. Not in scope here.
+// The plugin auto-drains tool_name === SEND_MESSAGE_TOOL entries on bind
+// recovery (the only auto-replay-safe op_type); other entries wait for
+// operator review via junto_journal_replay (idempotent through intent_id).
 let journal: JournalEntry[] = []
 let isDraining = false
 
@@ -305,19 +344,14 @@ function loadJournal(): void {
     journal = raw
       .split('\n')
       .filter((line: string) => line.trim().length > 0)
-      .map((line: string) => {
+      .map((line: string): JournalEntry | null => {
         try {
-          const parsed = JSON.parse(line) as Partial<JournalEntry>
-          if (typeof parsed.queue_id !== 'string') return null
-          if (typeof parsed.queued_at !== 'string') return null
-          if (!parsed.args || typeof parsed.args !== 'object') return null
-          // Legacy v0.0.18 entries lack op_type — default to send_message.
-          return {
-            queue_id: parsed.queue_id,
-            queued_at: parsed.queued_at,
-            op_type: parsed.op_type ?? 'send_message',
-            args: parsed.args,
-          } as JournalEntry
+          const parsed = JSON.parse(line) as Partial<JournalEntry> & { op_type?: string }
+          // normalizeLegacyEntry handles every pre-v0.0.20 shape: it back-
+          // derives tool_name from op_type for the send_message-only legacy
+          // case, fills missing intent_id/actor/schema_version, and
+          // normalizes op_type to its §4.1 catalog value.
+          return normalizeLegacyEntry(parsed, ACTOR)
         } catch {
           return null
         }
@@ -345,17 +379,16 @@ function persistJournal(): void {
   }
 }
 
-function enqueueJournal(op_type: string, args: Record<string, unknown>): { queue_id: string; queue_position: number } | null {
+function enqueueJournal(toolName: string, args: Record<string, unknown>): { queue_id: string; queue_position: number; intent_id: string } | null {
   if (journal.length >= JOURNAL_CAP) {
     process.stderr.write(`junto-inbox: journal at cap (${JOURNAL_CAP}); refusing to queue\n`)
     return null
   }
-  const queue_id = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
-  const entry: JournalEntry = { queue_id, queued_at: new Date().toISOString(), op_type, args }
+  const entry = makeJournalEntry(toolName, args, ACTOR)
   journal.push(entry)
   persistJournal()
-  debugLog(`enqueueJournal: ${queue_id} op=${op_type} pos=${journal.length}`)
-  return { queue_id, queue_position: journal.length }
+  debugLog(`enqueueJournal: ${entry.queue_id} tool=${entry.tool_name} op=${entry.op_type} pos=${journal.length}`)
+  return { queue_id: entry.queue_id, queue_position: journal.length, intent_id: entry.intent_id }
 }
 
 async function drainJournal(): Promise<void> {
@@ -377,19 +410,22 @@ async function drainJournal(): Promise<void> {
     while (journal.length > 0) {
       if (!sm || !sessionId) break
       const head = journal[0]
-      // v0.0.19 still only auto-replays send_message. Other op_types are kept
-      // in the journal for operator review (mechanism pending memory's reply
-      // on proxy-vs-hook). On encountering a non-send_message entry, leave it
-      // and stop draining — preserving order. When the operator-review tools
-      // ship, they will pop these explicitly.
-      if (head.op_type !== 'send_message') {
-        debugLog(`drainJournal: pausing at non-send_message entry ${head.queue_id} op=${head.op_type}`)
+      // Only send_message auto-replays. Other captured tools (hook-written
+      // mutations) wait for operator review via junto_journal_replay — they
+      // can't be safely batch-replayed without a human looking at the args
+      // first, and the replay path needs to thread __intent_id back to the
+      // server for op-log dedupe (§4.6). Stopping at the first non-send
+      // entry preserves order: every send_message ahead of a foreign entry
+      // drains; nothing after a foreign entry drains until operator clears
+      // the head. See learning_e6e.
+      if (head.tool_name !== SEND_MESSAGE_TOOL) {
+        debugLog(`drainJournal: pausing at non-send_message entry ${head.queue_id} tool=${head.tool_name}`)
         break
       }
       try {
         const result = await sm.callTool({
           name: 'memory_send_message',
-          arguments: { session_id: sessionId, ...head.args },
+          arguments: { session_id: sessionId, ...head.args, __intent_id: head.intent_id },
         })
         if (result.isError === true) {
           const content = result.content as Array<{ type: string; text?: string }> | undefined
@@ -439,7 +475,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.19' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.20' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -486,7 +522,11 @@ function noteHealth(newHealth: 'online' | 'offline'): void {
   // On recovery, drain journal and read inbox opportunistically. If we're
   // not bound, the supervisor's bindAndSubscribe will do this; if we ARE
   // bound (transient health flap during a still-alive session), do it now.
+  // First reload from disk to pick up any entries the PreToolUse hook
+  // appended while we were offline — the plugin's in-memory journal does
+  // not observe hook writes until reload.
   if (newHealth === 'online' && sm && sessionId) {
+    loadJournal()
     void drainJournal()
     void readInboxAndForward()
   }
@@ -563,7 +603,7 @@ async function callMemory(name: string, args: Record<string, unknown>) {
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.19' },
+  { name: 'junto-inbox', version: '0.0.20' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -611,6 +651,47 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         'caller should retry after a short delay or fall back to memory_start_session.',
       inputSchema: { type: 'object', properties: {}, required: [] },
     },
+    {
+      name: 'junto_journal_list',
+      description:
+        'List journal entries written by the PreToolUse hook (or the plugin\'s send_message handler) ' +
+        'while the shared-memory server was OFFLINE. Returns a summary array with queue_id, queued_at, ' +
+        'tool_name, op_type, intent_id, and an args-summary (top-level keys only — full payloads are not ' +
+        'returned to keep the operator-review surface compact). Use junto_journal_replay to retry an ' +
+        'entry or junto_journal_discard to drop it. Reloads from disk on every call so hook writes ' +
+        'made during the current session are visible without restarting the plugin.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      name: 'junto_journal_replay',
+      description:
+        'Replay one journal entry through the currently bound shared-memory session. Threads the entry\'s ' +
+        'intent_id back to the server via the __intent_id MCP param so the Phase 1 op-log can dedupe ' +
+        'cross-replay duplicates (spec §4.6). On success: removes the entry from the journal. On server ' +
+        'isError: leaves the entry in place and returns the error so the operator can inspect args. ' +
+        'On transport error: leaves the entry in place. Requires bound session (sm + sessionId).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          queue_id: { type: 'string', description: 'queue_id of the journal entry to replay' },
+        },
+        required: ['queue_id'],
+      },
+    },
+    {
+      name: 'junto_journal_discard',
+      description:
+        'Drop one journal entry without replaying. Use when the operator has determined the entry is ' +
+        'no longer relevant (stale, duplicate, or otherwise undesired). No server interaction; purely ' +
+        'a local journal modification.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          queue_id: { type: 'string', description: 'queue_id of the journal entry to discard' },
+        },
+        required: ['queue_id'],
+      },
+    },
   ],
 }))
 
@@ -647,6 +728,112 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   }
 
+  if (req.params.name === 'junto_journal_list') {
+    // Reload from disk so hook-written entries land in the operator view
+    // even if the plugin process hasn't seen a health transition since.
+    loadJournal()
+    const summary = journal.map(e => ({
+      queue_id: e.queue_id,
+      queued_at: e.queued_at,
+      intent_id: e.intent_id,
+      tool_name: e.tool_name,
+      op_type: e.op_type,
+      actor: e.actor,
+      // top-level keys of args only — full payloads can be large (storing
+      // entire learning bodies, spec content, etc.). Operator can dig
+      // deeper via the journal file on disk if needed.
+      arg_keys: Object.keys(e.args),
+    }))
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ count: summary.length, entries: summary, journal_file: JOURNAL_FILE }),
+      }],
+    }
+  }
+
+  if (req.params.name === 'junto_journal_replay') {
+    if (!sm || !sessionId) {
+      return { content: [{ type: 'text', text: 'junto_journal_replay: no bound session; cannot replay until reconnect' }], isError: true }
+    }
+    loadJournal()
+    const args = (req.params.arguments ?? {}) as { queue_id?: string }
+    const queueId = args.queue_id
+    if (typeof queueId !== 'string' || queueId.length === 0) {
+      return { content: [{ type: 'text', text: 'junto_journal_replay: queue_id required' }], isError: true }
+    }
+    const idx = journal.findIndex(e => e.queue_id === queueId)
+    if (idx < 0) {
+      return { content: [{ type: 'text', text: `junto_journal_replay: queue_id ${queueId} not found` }], isError: true }
+    }
+    const entry = journal[idx]
+    // Strip the mcp__shared-memory__ prefix to get the bare tool name the
+    // shared-memory MCP server actually exposes. The hook stores the full
+    // CC-visible tool_name so it survives across version-skew on adopter
+    // agents; the plugin's sm client uses the bare names.
+    const bareName = entry.tool_name.replace(/^mcp__shared-memory__/, '')
+    try {
+      const result = await sm.callTool({
+        name: bareName,
+        arguments: { session_id: sessionId, ...entry.args, __intent_id: entry.intent_id },
+      })
+      const text = (result.content as Array<{ type: string; text?: string }> | undefined)
+        ?.find(c => c.type === 'text')?.text ?? ''
+      if (result.isError === true) {
+        if (/session.*not.*found/i.test(text)) {
+          forceReconnect(`junto_journal_replay saw stale session_id (${text})`)
+        }
+        return { content: [{ type: 'text', text: `junto_journal_replay: server error: ${text}` }], isError: true }
+      }
+      // Success — remove the entry from the journal.
+      journal.splice(idx, 1)
+      persistJournal()
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            replayed: true,
+            queue_id: queueId,
+            intent_id: entry.intent_id,
+            tool_name: entry.tool_name,
+            server_response: text,
+            remaining: journal.length,
+          }),
+        }],
+      }
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err)
+      return { content: [{ type: 'text', text: `junto_journal_replay: transport error (${m}); entry left in journal` }], isError: true }
+    }
+  }
+
+  if (req.params.name === 'junto_journal_discard') {
+    loadJournal()
+    const args = (req.params.arguments ?? {}) as { queue_id?: string }
+    const queueId = args.queue_id
+    if (typeof queueId !== 'string' || queueId.length === 0) {
+      return { content: [{ type: 'text', text: 'junto_journal_discard: queue_id required' }], isError: true }
+    }
+    const idx = journal.findIndex(e => e.queue_id === queueId)
+    if (idx < 0) {
+      return { content: [{ type: 'text', text: `junto_journal_discard: queue_id ${queueId} not found` }], isError: true }
+    }
+    const dropped = journal.splice(idx, 1)[0]
+    persistJournal()
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          discarded: true,
+          queue_id: queueId,
+          tool_name: dropped.tool_name,
+          op_type: dropped.op_type,
+          remaining: journal.length,
+        }),
+      }],
+    }
+  }
+
   if (req.params.name !== 'send_message') {
     return { content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }], isError: true }
   }
@@ -667,7 +854,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
   // Link known-down → queue. Supervisor's drainJournal will deliver on reconnect.
   if (!sessionId || !sm) {
-    const q = enqueueJournal('send_message', sendArgs)
+    const q = enqueueJournal(SEND_MESSAGE_TOOL, sendArgs)
     if (!q) {
       return { content: [{ type: 'text', text: `send_message: journal at capacity (${JOURNAL_CAP}); message rejected` }], isError: true }
     }
@@ -701,7 +888,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       // dropped the message on the floor here.
       if (/session.*not.*found/i.test(text)) {
         forceReconnect(`send_message saw stale session_id (${text})`)
-        const q = enqueueJournal('send_message', sendArgs)
+        const q = enqueueJournal(SEND_MESSAGE_TOOL, sendArgs)
         if (q) {
           return {
             content: [{
@@ -722,7 +909,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   } catch (err) {
     // Transport-level failure (VPN dropped mid-call). Queue rather than lose.
     const m = err instanceof Error ? err.message : String(err)
-    const q = enqueueJournal('send_message', sendArgs)
+    const q = enqueueJournal(SEND_MESSAGE_TOOL, sendArgs)
     forceReconnect(`send_message transport error (${m})`)
     if (!q) {
       return { content: [{ type: 'text', text: `send_message: ${m} (journal at capacity; message lost)` }], isError: true }
@@ -947,7 +1134,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.19' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.20' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })

@@ -10,17 +10,23 @@ B reads it without anyone manually walking to B's terminal.
 
 ## Status
 
-v0.0.17 — loosens session-bind autopilot defaults from `depth_cap=1,
-budget=10` to `depth_cap=5, budget=30`. Override knobs unchanged
-(`JUNTO_AUTOPILOT_DEPTH_CAP`, `JUNTO_AUTOPILOT_BUDGET`). See
-[CHANGELOG.md](CHANGELOG.md) for full history including v0.0.16
-(stale-session-id healing across `/clear + go`) and earlier.
+v0.0.20 — Phase 0 capture mechanism per
+[`design:local-first-junto-v0-mvp`](https://github.com/tlemmons/junto-stack) v0.3.0 §8.
+Adds a CC `PreToolUse` hook (`hook.ts`) that captures the 13-tool
+mutation set when the plugin is `OFFLINE` per its health poller, plus
+three operator-review tools (`junto_journal_list`, `_replay`, `_discard`).
+v0.0.19 (heartbeat, statusline OFFLINE, autopilot-pause, journal at
+`~/.junto/journal/...`), v0.0.18 (persistent `send_message` outbox),
+v0.0.17 (loosened autopilot defaults: `depth_cap=5, budget=30`) carry
+forward. See [CHANGELOG.md](CHANGELOG.md) for full history.
 
 Functionally: subscribe-mode against `inbox://<project>/<agent>`,
 client-side `memory_autopilot_check_budget` gate for `chain_depth >= 1`,
 `get_session_id` tool for host-CC session sharing, paginated inbox drain,
 status file for statusLine indicator, `[REQUIRES REVIEW]` marker for
-messages tagged `require_human=true`.
+messages tagged `require_human=true`, 12s health probe with OFFLINE
+indicator after 3 consecutive failures, persistent local journal at
+`~/.junto/journal/<project>-<agent>.journal.jsonl` for offline mutations.
 
 Auth-bound: the agent identifier passed to `memory_start_session` MUST equal the
 URI's `<agent>` segment, otherwise subscribe raises and reads return
@@ -120,6 +126,81 @@ session invalidation and forces reconnect.
 
 - `send_message(to_agent, body, [to_project], [in_response_to], [require_human], [human_interacted], [priority], [category])` — calls `memory_send_message`. Pass the inbound message's `msg_id` as `in_response_to` for chain-depth threading. Set `human_interacted=true` ONLY when a human prompt entered between message receipt and your reply; `false` on autopilot replies. The flag is sender-asserted; the server uses it to reset `effective_chain_depth=0` so a fresh human turn does not blow the depth cap.
 - `get_session_id()` — returns `{status:"ready",session_id,project,agent}` or `{status:"not_ready",project,agent}`. Host CC's `go` macro uses this to share the plugin's session instead of opening a duplicate `memory_start_session`.
+- `junto_journal_list()` — returns a summary of journal entries written while the shared-memory server was OFFLINE (top-level `arg_keys` only; full args are on disk). Reloads from disk on every call so hook-written entries are visible.
+- `junto_journal_replay(queue_id)` — replays one entry through the bound session, threading the entry's `intent_id` as `__intent_id` so the Phase 1 op-log can dedupe. On success, removes from journal; on isError or transport error, leaves entry in place.
+- `junto_journal_discard(queue_id)` — drop one entry without replaying. Operator decides; no server interaction.
+
+## PreToolUse hook (v0.0.20)
+
+The Phase 0 capture mechanism for the **12 non-`send_message` mutation
+tools** lives in `hook.ts` — a `PreToolUse` hook configured per-agent
+in `.claude/settings.json`. It fires on `mcp__shared-memory__memory_*`
+tool calls and:
+
+1. **Reads** are allowed through unconditionally (`memory_query`,
+   `memory_get_*`, `memory_list_*`, `memory_find_function`,
+   `memory_health`, `memory_search_global`, `memory_checklist`,
+   `memory_db`, autopilot reads). Reads serve from live or fail loud;
+   they never journal.
+2. **Captured mutations** (the 13 tools in `schema.ts`'s `CAPTURE_SET`)
+   journal **only when the plugin reports `health_state="offline"`** in
+   `~/.claude/junto-inbox/<project>-<agent>.status`. The hook generates
+   an `intent_id` (UUID4), writes a v1 journal entry, and returns
+   `permissionDecision: "deny"` with a structured reason — the call
+   does NOT reach the server.
+3. **Online or status-file missing/unparseable** → the hook is a
+   no-op. Tool calls proceed normally.
+
+### Sample `.claude/settings.json` snippet
+
+For an agent launched from `C:\code\claudeTerminal\app\cterm-inbox\`:
+
+```jsonc
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__shared-memory__memory_*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun C:\\code\\claudeTerminal\\app\\cterm-inbox\\hook.ts",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- The hook reads `JUNTO_PROJECT` and `JUNTO_AGENT` from the CC process
+  environment. The same launcher that sets these for the plugin already
+  has them in scope, so no extra env wiring is needed.
+- `bun` must be on `PATH`. If your launcher uses a pinned bun (e.g.
+  `C:\Users\<you>\.bun\bin\bun.exe`), spell that out in `command`.
+- Adopter agents that **do not** configure this hook get
+  **graceful-degradation**: `send_message` is still journaled (the
+  plugin's own tool handler does that), but the 12 other mutation
+  tools fall through to the live MCP path and may silently succeed
+  during a transport half-open window. See the "Coverage boundary"
+  callout below.
+
+### Coverage boundary
+
+Phase 0 protects against silent loss for the 13 capture-set tools
+**only when the `PreToolUse` hook is configured in
+`.claude/settings.json`**. Without the hook:
+
+- `memory_send_message` IS still journaled (plugin handles it directly).
+- The other 12 mutation tools are NOT journaled.
+- All reads pass through unaffected.
+
+The structural fix for the silent-success class — a server-side op-log
+with `intent_id` reconciliation — is Phase 1
+(see `design:local-first-junto-v0-mvp` §4.6).
 
 ## Status file
 

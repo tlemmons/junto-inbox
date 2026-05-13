@@ -3,6 +3,76 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.20
+
+Phase 0 capture mechanism per `design:local-first-junto-v0-mvp` v0.3.0 §8.
+The remaining 12 mutation tools beyond `send_message` are now journaled
+on `OFFLINE`, plus three operator-review tools and the v1 journal entry
+schema finalized.
+
+- **`PreToolUse` hook (`hook.ts`).** Standalone Bun TS script wired into
+  per-agent `.claude/settings.json` with matcher `mcp__shared-memory__memory_*`.
+  Reads the plugin status file at
+  `~/.claude/junto-inbox/<project>-<agent>.status`; if
+  `health_state="offline"` AND the tool is in `schema.ts`'s
+  `CAPTURE_SET` (13 tools), generates a v1 journal entry with a
+  fresh `intent_id` (UUID4), appends it to
+  `~/.junto/journal/<project>-<agent>.journal.jsonl`, and returns
+  `permissionDecision: "deny"` with a structured reason — the actual
+  shared-memory call is blocked. On online OR for deny-list (read)
+  tools, the hook is a no-op. Hook fails open (allows the call) when
+  `JUNTO_PROJECT`/`JUNTO_AGENT` env vars are missing or when the
+  status file is unparseable — graceful-degradation property called
+  out in spec §8.
+- **Journal entry schema v1 finalized.** Each entry now carries
+  `queue_id`, `queued_at`, `intent_id` (threaded to server on replay
+  via `__intent_id` MCP param for op-log dedupe per spec §4.6),
+  `tool_name` (full `mcp__shared-memory__memory_*` name),
+  `args` (session_id stripped), `actor` (`{project, agent}`),
+  `op_type` (§4.1 catalog value), and `schema_version: 1`.
+  `loadJournal` upgrades legacy v0.0.18/v0.0.19 entries on read —
+  back-derives `tool_name` for the send_message-only legacy case,
+  fills missing fields, normalizes `op_type` (e.g.
+  `"send_message"` → `"message.sent"`).
+- **Operator-review tools.** Three new plugin tools registered alongside
+  `send_message` and `get_session_id`:
+  - `junto_journal_list()` — returns a summary of journaled entries
+    (top-level `arg_keys` only; full payloads are on disk). Reloads
+    from disk on each call so hook-written entries are visible
+    without restarting the plugin.
+  - `junto_journal_replay(queue_id)` — replays one entry through the
+    bound session, threading `__intent_id=<entry.intent_id>`. On
+    success: removes from journal. On isError or transport error:
+    leaves entry in place so the operator can fix args / retry.
+  - `junto_journal_discard(queue_id)` — drops one entry without
+    replaying. Purely local; no server interaction.
+- **`drainJournal` threads `__intent_id`.** The auto-drain path for
+  `tool_name === SEND_MESSAGE_TOOL` now passes the entry's
+  `intent_id` back to the server on every replay, so once Phase 1
+  op-log ships, cross-retry duplicate writes can be deduped.
+- **Shared schema module (`schema.ts`).** New file holding
+  `CAPTURE_SET`, `DENY_LIST`, `TOOL_OP_TYPE_MAP`, `JournalEntry`
+  type, and path/factory helpers (`statusFilePath`, `journalFilePath`,
+  `makeJournalEntry`, `normalizeLegacyEntry`). Imported by both
+  `server.ts` and `hook.ts` so they cannot drift on which tools are
+  captured vs denied.
+
+**Coverage boundary (explicit MVP property):** Phase 0 protects against
+silent loss for the 13 capture-set tools **only when the hook is
+configured in `.claude/settings.json`**. Without the hook,
+`send_message` IS still journaled (plugin's tool handler), but the
+other 12 mutation tools fall through to the live MCP path and may
+silently succeed during a transport half-open window. The structural
+fix for half-open silent-success is server-side op-log + `intent_id`
+reconciliation (Phase 1).
+
+**Known race window (accepted in MVP):** The hook and the plugin's
+`send_message` handler can both write to the journal file when offline.
+The plugin uses full-rewrite (`persistJournal`); the hook uses
+append-only. A concurrent plugin-rewrite during a hook-append can lose
+the hook entry. The window is microseconds. Phase 1's server-side
+op-log `intent_id` dedupe heals any duplicate replays that result.
+
 ## v0.0.19
 
 Phase 0 of `design:local-first-junto-v0-mvp` v0.2.0. Three additions on top

@@ -22,6 +22,13 @@
  *   red ●    reconnecting, or stale >120s
  *   grey ●   shutdown
  *
+ * v0.0.19 additions:
+ *   OFFLINE  health_state==='offline' (3+ consecutive memory_health failures).
+ *            Overrides connected/reconnecting coloring — server is unreachable
+ *            regardless of bound-session state. Renders as bold-red OFFLINE
+ *            label so the operator sees it independent of glyph color.
+ *   j:N      journal_count > 0 — count of queued mutations awaiting drain.
+ *
  * Exits 0 in all cases. Failures are silent so a missing file or unparseable
  * payload doesn't garble the user's status line.
  */
@@ -48,6 +55,8 @@ const file = join(homedir(), '.claude', 'junto-inbox', `${project}-${agent}.stat
 
 type Status = {
   state?: 'connected' | 'reconnecting' | 'shutdown'
+  health_state?: 'online' | 'offline'
+  journal_count?: number
   session_id?: string | null
   last_update?: string
   pid?: number
@@ -78,6 +87,7 @@ const lastMs = payload.last_update ? new Date(payload.last_update).getTime() : m
 const ageS = Math.max(0, Math.floor((Date.now() - lastMs) / 1000))
 
 const RESET = '\x1b[0m'
+const BOLD = '\x1b[1m'
 const GREEN = '\x1b[32m'
 const YELLOW = '\x1b[33m'
 const RED = '\x1b[31m'
@@ -87,7 +97,13 @@ const DIM = '\x1b[2m'
 let glyph: string
 let label: string
 
-if (payload.state === 'shutdown') {
+// OFFLINE (health_state==='offline') overrides connected/reconnecting
+// coloring because the server is unreachable regardless of whether we still
+// have a bound session locally. v0.0.19+.
+if (payload.health_state === 'offline') {
+  glyph = `${RED}●${RESET}`
+  label = `${BOLD}${RED}OFFLINE${RESET}`
+} else if (payload.state === 'shutdown') {
   glyph = `${GREY}●${RESET}`
   label = 'shutdown'
 } else if (payload.state === 'reconnecting') {
@@ -117,5 +133,14 @@ if (ap && typeof ap.current_count === 'number' && typeof ap.hourly_budget === 'n
   budget = ` ${color}${ap.current_count}/${ap.hourly_budget}${RESET}`
 }
 
-const out = `${glyph} junto-inbox ${DIM}${project}/${agent}${RESET} ${label}${budget}`
+let journalBadge = ''
+if (typeof payload.journal_count === 'number' && payload.journal_count > 0) {
+  // YELLOW when queue is non-empty during ONLINE (catching up), RED when
+  // OFFLINE (queue still growing or stuck). Bare digit count to keep the
+  // statusline tight; operator can drill in via the file directly.
+  const color = payload.health_state === 'offline' ? RED : YELLOW
+  journalBadge = ` ${color}j:${payload.journal_count}${RESET}`
+}
+
+const out = `${glyph} junto-inbox ${DIM}${project}/${agent}${RESET} ${label}${budget}${journalBadge}`
 process.stdout.write(out)

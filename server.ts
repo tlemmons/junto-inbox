@@ -7,6 +7,30 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.19 — Phase 0 of design:local-first-junto-v0-mvp. Three additions on top
+ *          of v0.0.18: (1) sessionless health poller calling memory_health
+ *          every 12s; after 3 consecutive failures (~45s window), declares
+ *          OFFLINE; recovery on next success. (2) Statusline OFFLINE indicator
+ *          + journal-count badge — file format gains health_state and
+ *          journal_count fields, statusline renders them. (3) While OFFLINE,
+ *          readInboxAndForward becomes a no-op so the host CC doesn't try to
+ *          autopilot-reply against a dead server (its replies would queue
+ *          locally and never actually deliver in time to matter). On recovery
+ *          (offline→online) the journal drains and the inbox is read.
+ *          File-path migration: ~/.claude/junto-inbox/<P>-<A>.outbox.jsonl →
+ *          ~/.junto/journal/<P>-<A>.journal.jsonl on first v0.0.19 startup
+ *          (one-shot, idempotent — won't clobber if new path already exists).
+ *          Internal rename: outbox → journal everywhere. Entries gain an
+ *          op_type field (forward-compat; legacy entries default to
+ *          "send_message"). Status file moves from ~/.claude/junto-inbox/...
+ *          stays put — statusline.ts reads that path; the journal file is the
+ *          only thing that moves. Honest scope: this v0.0.19 still only
+ *          captures send_message; the other 12 mutation tools listed in
+ *          memory's Phase 0 spec await a capture-mechanism decision (proxy vs
+ *          PreToolUse hook). Heartbeat + statusline + autopilot-pause are
+ *          fully shipped. Coverage is partial vs the spec's full Phase 0 list,
+ *          and partial vs the silent-success-on-write failure class memory
+ *          flagged in its reply (that's Phase 1+ territory).
  * v0.0.18 — persistent outbox for offline send_message. When the shared-memory
  *          link is down (VPN drop, server restart, transport error mid-call),
  *          send_message now writes the request to
@@ -154,7 +178,7 @@ import {
   CallToolRequestSchema,
   ResourceUpdatedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
@@ -201,9 +225,14 @@ if (!PROJECT || !AGENT) {
 const INBOX_URI = `inbox://${PROJECT}/${AGENT}`
 const STATUS_DIR = join(homedir(), '.claude', 'junto-inbox')
 const STATUS_FILE = join(STATUS_DIR, `${PROJECT}-${AGENT}.status`)
-const OUTBOX_FILE = join(STATUS_DIR, `${PROJECT}-${AGENT}.outbox.jsonl`)
-const OUTBOX_CAP = 1000
+const JOURNAL_DIR = join(homedir(), '.junto', 'journal')
+const JOURNAL_FILE = join(JOURNAL_DIR, `${PROJECT}-${AGENT}.journal.jsonl`)
+const LEGACY_OUTBOX_FILE = join(STATUS_DIR, `${PROJECT}-${AGENT}.outbox.jsonl`)
+const JOURNAL_CAP = 1000
+const HEALTH_INTERVAL_MS = 12_000
+const OFFLINE_FAIL_THRESHOLD = 3
 let statusDirCreated = false
+let journalDirCreated = false
 
 type PluginStatus = 'connected' | 'reconnecting' | 'shutdown'
 
@@ -220,6 +249,8 @@ function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}):
       session_id: sessionId,
       pid: process.pid,
       last_update: new Date().toISOString(),
+      health_state: healthState,
+      journal_count: journal.length,
       ...extras,
     })
     writeFileSync(STATUS_FILE, payload)
@@ -228,81 +259,133 @@ function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}):
   }
 }
 
-// Persistent outbox for offline send_message. Entries are
-// memory_send_message arg blobs (sans session_id, which is rebound per
-// reconnect). Drained FIFO on every successful bindAndSubscribe before the
-// inbox-forward step.
-type QueuedSend = {
+// Persistent journal for offline mutation tool calls. v0.0.19 expands the
+// v0.0.18 send_message-only outbox into a journal scaffolded for additional
+// op_types; the capture-mechanism for the other 12 tools listed in memory's
+// Phase 0 spec (proxy vs PreToolUse hook) is unresolved, so this version
+// still only enqueues send_message. Format change: each entry now carries
+// op_type; legacy entries (v0.0.18, no op_type) default to "send_message"
+// on load. File path moved from STATUS_DIR (Claude-Code-local) to
+// ~/.junto/journal (Junto-namespaced) per memory's design coordination.
+type JournalEntry = {
   queue_id: string
   queued_at: string
+  op_type: string
   args: Record<string, unknown>
 }
 
-let outbox: QueuedSend[] = []
+let journal: JournalEntry[] = []
 let isDraining = false
 
-function loadOutbox(): void {
+function migrateOutboxToJournal(): void {
   try {
-    if (!existsSync(OUTBOX_FILE)) return
-    const raw = readFileSync(OUTBOX_FILE, 'utf8')
-    outbox = raw
+    if (!existsSync(LEGACY_OUTBOX_FILE)) return
+    if (existsSync(JOURNAL_FILE)) {
+      // New file already present — never clobber. The legacy file is stale.
+      process.stderr.write(`junto-inbox: legacy outbox ${LEGACY_OUTBOX_FILE} present but journal already exists at new path — leaving legacy alone\n`)
+      debugLog(`migrateOutboxToJournal: both files present, no-op`)
+      return
+    }
+    if (!journalDirCreated) {
+      mkdirSync(JOURNAL_DIR, { recursive: true })
+      journalDirCreated = true
+    }
+    renameSync(LEGACY_OUTBOX_FILE, JOURNAL_FILE)
+    process.stderr.write(`junto-inbox: migrated ${LEGACY_OUTBOX_FILE} → ${JOURNAL_FILE}\n`)
+    debugLog(`migrateOutboxToJournal: success`)
+  } catch (err) {
+    debugLog(`migrateOutboxToJournal: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+function loadJournal(): void {
+  try {
+    if (!existsSync(JOURNAL_FILE)) return
+    const raw = readFileSync(JOURNAL_FILE, 'utf8')
+    journal = raw
       .split('\n')
       .filter((line: string) => line.trim().length > 0)
       .map((line: string) => {
         try {
-          return JSON.parse(line) as QueuedSend
+          const parsed = JSON.parse(line) as Partial<JournalEntry>
+          if (typeof parsed.queue_id !== 'string') return null
+          if (typeof parsed.queued_at !== 'string') return null
+          if (!parsed.args || typeof parsed.args !== 'object') return null
+          // Legacy v0.0.18 entries lack op_type — default to send_message.
+          return {
+            queue_id: parsed.queue_id,
+            queued_at: parsed.queued_at,
+            op_type: parsed.op_type ?? 'send_message',
+            args: parsed.args,
+          } as JournalEntry
         } catch {
           return null
         }
       })
-      .filter((x: QueuedSend | null): x is QueuedSend => x !== null)
-    if (outbox.length > 0) {
-      process.stderr.write(`junto-inbox: loaded ${outbox.length} queued outbound message(s) from outbox\n`)
-      debugLog(`loadOutbox: ${outbox.length} entries`)
+      .filter((x: JournalEntry | null): x is JournalEntry => x !== null)
+    if (journal.length > 0) {
+      process.stderr.write(`junto-inbox: loaded ${journal.length} journaled mutation(s) from journal\n`)
+      debugLog(`loadJournal: ${journal.length} entries`)
     }
   } catch (err) {
-    debugLog(`loadOutbox: ${err instanceof Error ? err.message : String(err)}`)
+    debugLog(`loadJournal: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
-function persistOutbox(): void {
+function persistJournal(): void {
   try {
-    if (!statusDirCreated) {
-      mkdirSync(STATUS_DIR, { recursive: true })
-      statusDirCreated = true
+    if (!journalDirCreated) {
+      mkdirSync(JOURNAL_DIR, { recursive: true })
+      journalDirCreated = true
     }
-    const body = outbox.length === 0 ? '' : outbox.map(q => JSON.stringify(q)).join('\n') + '\n'
-    writeFileSync(OUTBOX_FILE, body)
+    const body = journal.length === 0 ? '' : journal.map(q => JSON.stringify(q)).join('\n') + '\n'
+    writeFileSync(JOURNAL_FILE, body)
   } catch (err) {
-    debugLog(`persistOutbox: ${err instanceof Error ? err.message : String(err)}`)
+    debugLog(`persistJournal: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
-function enqueueOutbox(args: Record<string, unknown>): { queue_id: string; queue_position: number } | null {
-  if (outbox.length >= OUTBOX_CAP) {
-    process.stderr.write(`junto-inbox: outbox at cap (${OUTBOX_CAP}); refusing to queue\n`)
+function enqueueJournal(op_type: string, args: Record<string, unknown>): { queue_id: string; queue_position: number } | null {
+  if (journal.length >= JOURNAL_CAP) {
+    process.stderr.write(`junto-inbox: journal at cap (${JOURNAL_CAP}); refusing to queue\n`)
     return null
   }
   const queue_id = `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
-  const entry: QueuedSend = { queue_id, queued_at: new Date().toISOString(), args }
-  outbox.push(entry)
-  persistOutbox()
-  debugLog(`enqueueOutbox: ${queue_id} pos=${outbox.length}`)
-  return { queue_id, queue_position: outbox.length }
+  const entry: JournalEntry = { queue_id, queued_at: new Date().toISOString(), op_type, args }
+  journal.push(entry)
+  persistJournal()
+  debugLog(`enqueueJournal: ${queue_id} op=${op_type} pos=${journal.length}`)
+  return { queue_id, queue_position: journal.length }
 }
 
-async function drainOutbox(): Promise<void> {
-  if (isDraining || outbox.length === 0 || !sm || !sessionId) return
+async function drainJournal(): Promise<void> {
+  if (isDraining || journal.length === 0 || !sm || !sessionId) return
+  if (healthState === 'offline') {
+    // Don't drain while the health poller has the server marked unreachable —
+    // sends would just fail and we'd burn cycles. noteHealth's offline→online
+    // transition explicitly retriggers this when the server is back.
+    debugLog(`drainJournal: skipped, healthState=offline`)
+    return
+  }
   isDraining = true
-  const total = outbox.length
+  const total = journal.length
   let drained = 0
   let dropped = 0
   try {
-    process.stderr.write(`junto-inbox: draining outbox (${total} message(s))\n`)
-    debugLog(`drainOutbox: start total=${total}`)
-    while (outbox.length > 0) {
+    process.stderr.write(`junto-inbox: draining journal (${total} entry(s))\n`)
+    debugLog(`drainJournal: start total=${total}`)
+    while (journal.length > 0) {
       if (!sm || !sessionId) break
-      const head = outbox[0]
+      const head = journal[0]
+      // v0.0.19 still only auto-replays send_message. Other op_types are kept
+      // in the journal for operator review (mechanism pending memory's reply
+      // on proxy-vs-hook). On encountering a non-send_message entry, leave it
+      // and stop draining — preserving order. When the operator-review tools
+      // ship, they will pop these explicitly.
+      if (head.op_type !== 'send_message') {
+        debugLog(`drainJournal: pausing at non-send_message entry ${head.queue_id} op=${head.op_type}`)
+        break
+      }
       try {
         const result = await sm.callTool({
           name: 'memory_send_message',
@@ -313,31 +396,124 @@ async function drainOutbox(): Promise<void> {
           const text = content?.find(c => c.type === 'text')?.text ?? ''
           if (/session.*not.*found/i.test(text)) {
             // Leave head in place; supervisor will rebind and try again.
-            forceReconnect(`drainOutbox saw stale session_id (${text})`)
+            forceReconnect(`drainJournal saw stale session_id (${text})`)
             break
           }
           // Other server-side rejection (malformed args, missing parent, etc).
           // Retrying won't help — drop the entry and continue.
-          process.stderr.write(`junto-inbox: dropping outbox entry ${head.queue_id}: ${text}\n`)
-          debugLog(`drainOutbox: drop ${head.queue_id} reason="${text}"`)
-          outbox.shift()
-          persistOutbox()
+          process.stderr.write(`junto-inbox: dropping journal entry ${head.queue_id}: ${text}\n`)
+          debugLog(`drainJournal: drop ${head.queue_id} reason="${text}"`)
+          journal.shift()
+          persistJournal()
           dropped++
           continue
         }
-        outbox.shift()
-        persistOutbox()
+        journal.shift()
+        persistJournal()
         drained++
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err)
-        process.stderr.write(`junto-inbox: drainOutbox interrupted (${m}); will retry on next reconnect\n`)
-        debugLog(`drainOutbox: transport error ${m}`)
+        process.stderr.write(`junto-inbox: drainJournal interrupted (${m}); will retry on next reconnect\n`)
+        debugLog(`drainJournal: transport error ${m}`)
         break
       }
     }
   } finally {
     isDraining = false
-    debugLog(`drainOutbox: end drained=${drained} dropped=${dropped} remaining=${outbox.length}`)
+    debugLog(`drainJournal: end drained=${drained} dropped=${dropped} remaining=${journal.length}`)
+  }
+}
+
+// Sessionless health probe — runs continuously regardless of bound-session
+// state. After OFFLINE_FAIL_THRESHOLD consecutive failures (~45s at 12s
+// interval), the plugin enters OFFLINE state: statusline indicator goes red,
+// readInboxAndForward becomes a no-op (so the host CC doesn't autopilot-reply
+// against a dead server, which would queue locally and never deliver in
+// time to matter). On next successful probe, returns to ONLINE and resumes.
+let healthState: 'online' | 'offline' = 'online'
+let healthFailCount = 0
+let healthTimer: ReturnType<typeof setInterval> | null = null
+let healthClient: Client | null = null
+
+async function probeServerHealth(): Promise<boolean> {
+  try {
+    if (!healthClient) {
+      const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.19' }, { capabilities: {} })
+      await client.connect(transport)
+      healthClient = client
+    }
+    const result = await healthClient.callTool({
+      name: 'memory_health',
+      arguments: { include_storage: true },
+    })
+    if (result.isError === true) return false
+    const content = result.content as Array<{ type: string; text?: string }> | undefined
+    const text = content?.find(c => c.type === 'text')?.text
+    if (!text) return false
+    try {
+      const parsed = JSON.parse(text) as { status?: string }
+      // 'ok' is the green path; 'degraded' still means server reachable.
+      // Anything else (or missing) → unhealthy. memory_health was introduced
+      // server-side 2026-05-13 — old servers will return tool-not-found
+      // isError, which falls through to false above.
+      return parsed.status === 'ok' || parsed.status === 'degraded'
+    } catch {
+      return false
+    }
+  } catch {
+    // Transport-level failure. Reset client so next attempt rebuilds it.
+    try { await healthClient?.close() } catch {}
+    healthClient = null
+    return false
+  }
+}
+
+function noteHealth(newHealth: 'online' | 'offline'): void {
+  if (healthState === newHealth) return
+  const prev = healthState
+  healthState = newHealth
+  if (newHealth === 'offline') {
+    process.stderr.write(`junto-inbox: server unreachable (${OFFLINE_FAIL_THRESHOLD} consecutive memory_health failures) — OFFLINE\n`)
+    debugLog(`noteHealth: ${prev}→offline`)
+  } else {
+    process.stderr.write(`junto-inbox: server reachable — ONLINE\n`)
+    debugLog(`noteHealth: ${prev}→online`)
+  }
+  // Reflect in status file using whichever pluginState the supervisor is in.
+  const currentPluginState: PluginStatus = sm ? 'connected' : 'reconnecting'
+  writeStatus(currentPluginState, { source: 'health-poller', health_transition: `${prev}->${newHealth}` })
+  // On recovery, drain journal and read inbox opportunistically. If we're
+  // not bound, the supervisor's bindAndSubscribe will do this; if we ARE
+  // bound (transient health flap during a still-alive session), do it now.
+  if (newHealth === 'online' && sm && sessionId) {
+    void drainJournal()
+    void readInboxAndForward()
+  }
+}
+
+function startHealthPoller(): void {
+  stopHealthPoller()
+  healthTimer = setInterval(() => {
+    void probeServerHealth().then(ok => {
+      if (ok) {
+        healthFailCount = 0
+        if (healthState === 'offline') noteHealth('online')
+      } else {
+        healthFailCount++
+        debugLog(`probeServerHealth: fail #${healthFailCount}`)
+        if (healthFailCount >= OFFLINE_FAIL_THRESHOLD && healthState === 'online') {
+          noteHealth('offline')
+        }
+      }
+    })
+  }, HEALTH_INTERVAL_MS)
+}
+
+function stopHealthPoller(): void {
+  if (healthTimer !== null) {
+    clearInterval(healthTimer)
+    healthTimer = null
   }
 }
 
@@ -387,7 +563,7 @@ async function callMemory(name: string, args: Record<string, unknown>) {
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.18' },
+  { name: 'junto-inbox', version: '0.0.19' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -489,11 +665,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     category: (args.category as string | undefined) ?? 'info',
   }
 
-  // Link known-down → queue. Supervisor's drainOutbox will deliver on reconnect.
+  // Link known-down → queue. Supervisor's drainJournal will deliver on reconnect.
   if (!sessionId || !sm) {
-    const q = enqueueOutbox(sendArgs)
+    const q = enqueueJournal('send_message', sendArgs)
     if (!q) {
-      return { content: [{ type: 'text', text: `send_message: outbox at capacity (${OUTBOX_CAP}); message rejected` }], isError: true }
+      return { content: [{ type: 'text', text: `send_message: journal at capacity (${JOURNAL_CAP}); message rejected` }], isError: true }
     }
     return {
       content: [{
@@ -525,7 +701,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       // dropped the message on the floor here.
       if (/session.*not.*found/i.test(text)) {
         forceReconnect(`send_message saw stale session_id (${text})`)
-        const q = enqueueOutbox(sendArgs)
+        const q = enqueueJournal('send_message', sendArgs)
         if (q) {
           return {
             content: [{
@@ -546,10 +722,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   } catch (err) {
     // Transport-level failure (VPN dropped mid-call). Queue rather than lose.
     const m = err instanceof Error ? err.message : String(err)
-    const q = enqueueOutbox(sendArgs)
+    const q = enqueueJournal('send_message', sendArgs)
     forceReconnect(`send_message transport error (${m})`)
     if (!q) {
-      return { content: [{ type: 'text', text: `send_message: ${m} (outbox at capacity; message lost)` }], isError: true }
+      return { content: [{ type: 'text', text: `send_message: ${m} (journal at capacity; message lost)` }], isError: true }
     }
     return {
       content: [{
@@ -630,6 +806,15 @@ type InboxPage = {
 
 async function readInboxAndForward() {
   if (!sm) return
+  if (healthState === 'offline') {
+    // Server unreachable (3+ consecutive health failures). Skip delivery so
+    // the host CC doesn't autopilot-reply against a dead server — its
+    // replies would queue in the journal but the original sender is waiting
+    // and the chain breaks. On health recovery (noteHealth offline→online)
+    // this function is invoked again to drain whatever piled up.
+    debugLog(`readInboxAndForward: skipped, healthState=offline`)
+    return
+  }
   if (!agentReady) {
     debugLog(`readInboxAndForward: skipped, agent not ready (waiting for get_session_id or send_message)`)
     return
@@ -762,7 +947,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.18' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.19' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })
@@ -803,7 +988,7 @@ async function bindAndSubscribe(): Promise<void> {
   debugLog(`bindAndSubscribe: connected session=${sessionId} sub=${INBOX_URI}`)
   writeStatus('connected', { source: 'bind' })
 
-  await drainOutbox()
+  await drainJournal()
   await readInboxAndForward()
 }
 
@@ -842,17 +1027,21 @@ async function supervisor(): Promise<void> {
 async function shutdown(reason: string) {
   process.stderr.write(`junto-inbox: shutdown (${reason})\n`)
   stopHeartbeat()
+  stopHealthPoller()
   writeStatus('shutdown', { reason })
   try {
     if (sm && sessionId) await callMemory('memory_end_session', { session_id: sessionId, summary: 'junto-inbox shutting down' })
   } catch {}
+  try { await healthClient?.close() } catch {}
   process.exit(0)
 }
 
 process.on('SIGINT', () => void shutdown('SIGINT'))
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
 
-loadOutbox()
+migrateOutboxToJournal()
+loadJournal()
+startHealthPoller()
 await mcp.connect(new StdioServerTransport())
 void supervisor()
 process.stderr.write(`junto-inbox: subscribe-mode for ${PROJECT}/${AGENT}\n`)

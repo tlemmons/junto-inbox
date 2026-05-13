@@ -3,6 +3,54 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.19
+
+Phase 0 of `design:local-first-junto-v0-mvp` v0.2.0. Three additions on top
+of v0.0.18's outbox foundation.
+
+- **Sessionless health poller.** Background loop calls `memory_health` every
+  12s via an independent MCP client (no session required, added server-side
+  by junto-memory v1.29.0). After 3 consecutive failures (~45s window) the
+  plugin enters `health_state="offline"`; recovers to `"online"` on the next
+  success. Failure detection is independent of the bound-session heartbeat:
+  the latter only watches our specific session's aliveness, while
+  `memory_health` watches whether the server is reachable at all.
+- **Statusline OFFLINE indicator + journal-count badge.** Status-file format
+  gains `health_state` (`online`/`offline`) and `journal_count` (queued
+  mutations). `statusline.ts` renders OFFLINE in bold red overriding the
+  normal connected/reconnecting glyph coloring, plus a `j:N` badge whenever
+  the journal is non-empty (yellow online — catching up; red offline — stuck).
+- **Autopilot pause while OFFLINE.** `readInboxAndForward` becomes a no-op
+  while `health_state="offline"` so the host CC doesn't autopilot-reply
+  against a dead server (its replies would queue locally and never deliver
+  in time to matter). On health recovery (`offline`→`online`) the journal
+  drains and the inbox is read opportunistically.
+- **File-path migration: outbox → journal at new path.** `~/.claude/junto-inbox/
+  <P>-<A>.outbox.jsonl` → `~/.junto/journal/<P>-<A>.journal.jsonl` on first
+  v0.0.19 startup. One-shot, idempotent (won't clobber if the new path
+  already exists). Internal rename: `outbox` → `journal` everywhere.
+  Status file stays at `~/.claude/junto-inbox/` — `statusline.ts` reads
+  that path, no change needed there. Per memory's coordination: once the
+  journal spans more than just plugin-internal state, the `~/.junto/`
+  namespace fits better than the Claude-Code-local `~/.claude/`.
+- **Entry format gains `op_type`.** Forward-compat for the broader Phase 0
+  mutation list (memory_record_learning, memory_store, memory_define_spec,
+  etc — 13 tools total per memory's spec §4.1 op_type catalog). v0.0.19
+  still only captures `send_message`; the other 12 await a capture-mechanism
+  decision (plugin proxy vs PreToolUse hook — coordination in flight with
+  memory@junto). Legacy v0.0.18 entries lack `op_type` and default to
+  `"send_message"` on load.
+
+**Honest scope vs the full Phase 0 spec:**
+- Heartbeat + statusline + autopilot-pause + file migration: shipped.
+- Journal capture: still send_message only (matches v0.0.18 scope).
+- Operator-review tools (`junto_journal_list/_replay/_discard`): not in
+  this version — only needed once non-send_message entries can land.
+- Silent-success-on-write coverage: NOT addressed by Phase 0 at all per
+  memory's reply — that's the half-open-TCP failure class that requires
+  Phase 1+ server-side op-log. v0.0.19's journal protects against
+  `sm==null` and explicit transport errors only.
+
 ## v0.0.18
 
 - **Persistent outbox for offline `send_message`.** When the shared-memory link

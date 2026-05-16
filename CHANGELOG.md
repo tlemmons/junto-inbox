@@ -3,6 +3,45 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.21
+
+Fixes the ghost-session healing loop that v0.0.16 was supposed to close
+(`learning_782be7ee1b938dd1` recurred — the v0.0.16 fix did not actually
+prevent it; this version does).
+
+**Symptom.** Plugin holds a stale `session_id` indefinitely. Statusline
+reports `ONLINE` and the status file's `state` field reads `"connected"`,
+yet every `memory_*` call returns
+`ERROR: Session 'X' not found. Call memory_start_session first to register
+your session.` and no reconnect ever fires.
+
+**Cause.** The shared-memory MCP server signals session-not-found via
+*content text* with an `"ERROR:"` prefix, **not** via the MCP envelope's
+`isError` flag. v0.0.16's healing paths (`heartbeatOnce`, `send_message`,
+`drainJournal`, `junto_journal_replay`) all checked
+`result.isError === true` only, so:
+
+- The 30s background heartbeat silently passed forever (response body was
+  `ERROR:...` but `isError` was unset).
+- The supervisor's reconnect promise never rejected.
+- `bindAndSubscribe` never re-ran.
+- `sessionId` stayed pinned at the dead value.
+
+**Fix.** New `unwrapToolError(res)` helper returns the error text whether
+the server signalled via `isError=true` **or** via an `ERROR:` content-text
+prefix; returns `null` on actual success. All four call sites use it.
+Behaviour is identical when the server DOES set `isError`, so this is
+forward-compat with a future server-side change to standard MCP error
+semantics.
+
+**Diagnosis.** Empirically confirmed by calling
+`memory_heartbeat(session_id="<known-stale>")` directly and observing the
+wrapper shape `{"result":"ERROR: Session ... not found..."}` — identical
+in envelope to a success response.
+
+No new env vars. No host-CC contract changes. No `plugin.json` bump
+(stays at 0.0.17 pending the separate Tom-gated drift fix).
+
 ## v0.0.20
 
 Phase 0 capture mechanism per `design:local-first-junto-v0-mvp` v0.3.0 §8.

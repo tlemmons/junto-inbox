@@ -7,6 +7,24 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.21 — fixes the ghost-session healing loop that v0.0.16 was supposed to
+ *          close (learning_782be7ee1b938dd1 recurred). Symptom: plugin holds a
+ *          stale session_id forever, statusline reports ONLINE / state:connected,
+ *          every memory_* call returns "ERROR: Session 'X' not found...", and
+ *          no reconnect ever fires. Cause: shared-memory server signals
+ *          session-not-found via *content text* with an "ERROR:" prefix, NOT
+ *          via the MCP envelope's isError flag. v0.0.16's healing paths
+ *          (heartbeatOnce, send_message, drainJournal, junto_journal_replay)
+ *          all checked res.isError === true only, so the 30s heartbeat
+ *          silently passed forever and the supervisor never re-bound. Fix:
+ *          new unwrapToolError() helper returns the error text whether the
+ *          server signalled via isError=true OR via an "ERROR:" content-text
+ *          prefix; null on success. All four call sites updated. Behaviour
+ *          identical when the server DOES set isError, so forward-compat with
+ *          a future server fix that switches to standard MCP error semantics.
+ *          Diagnosed by calling memory_heartbeat with a known-stale id and
+ *          observing the wrapper shape identical to a success response.
+ *          No new env vars; no host-CC contract changes.
  * v0.0.20 — Phase 0 capture mechanism per design:local-first-junto-v0-mvp v0.3.0
  *          §8: CC PreToolUse hook (hook.ts) captures the 13-tool mutation set
  *          (memory_record_learning, _store, _define_spec, _register_function,
@@ -427,18 +445,17 @@ async function drainJournal(): Promise<void> {
           name: 'memory_send_message',
           arguments: { session_id: sessionId, ...head.args, __intent_id: head.intent_id },
         })
-        if (result.isError === true) {
-          const content = result.content as Array<{ type: string; text?: string }> | undefined
-          const text = content?.find(c => c.type === 'text')?.text ?? ''
-          if (/session.*not.*found/i.test(text)) {
+        const errText = unwrapToolError(result)
+        if (errText !== null) {
+          if (/session.*not.*found/i.test(errText)) {
             // Leave head in place; supervisor will rebind and try again.
-            forceReconnect(`drainJournal saw stale session_id (${text})`)
+            forceReconnect(`drainJournal saw stale session_id (${errText})`)
             break
           }
           // Other server-side rejection (malformed args, missing parent, etc).
           // Retrying won't help — drop the entry and continue.
-          process.stderr.write(`junto-inbox: dropping journal entry ${head.queue_id}: ${text}\n`)
-          debugLog(`drainJournal: drop ${head.queue_id} reason="${text}"`)
+          process.stderr.write(`junto-inbox: dropping journal entry ${head.queue_id}: ${errText}\n`)
+          debugLog(`drainJournal: drop ${head.queue_id} reason="${errText}"`)
           journal.shift()
           persistJournal()
           dropped++
@@ -475,7 +492,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.20' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.21' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -602,8 +619,23 @@ async function callMemory(name: string, args: Record<string, unknown>) {
   }
 }
 
+// v0.0.21: shared-memory MCP server signals errors two ways — (a) standard
+// MCP isError=true with the error in content text, and (b) a "successful"
+// response wrapping an "ERROR: ..." string in content text without isError.
+// Session-not-found rejections from memory_heartbeat, memory_send_message,
+// and others ship via (b); v0.0.16's isError-only checks missed them and
+// left the plugin pinned to a server-rejected sessionId. Returns the error
+// text on either shape, null on actual success.
+function unwrapToolError(res: { isError?: boolean; content?: unknown }): string | null {
+  const text = (res.content as Array<{ type: string; text?: string }> | undefined)
+    ?.find(c => c.type === 'text')?.text ?? ''
+  if (res.isError === true) return text || '(no body)'
+  if (/^ERROR:/i.test(text)) return text
+  return null
+}
+
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.20' },
+  { name: 'junto-inbox', version: '0.0.21' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -777,14 +809,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         name: bareName,
         arguments: { session_id: sessionId, ...entry.args, __intent_id: entry.intent_id },
       })
+      const errText = unwrapToolError(result)
+      if (errText !== null) {
+        if (/session.*not.*found/i.test(errText)) {
+          forceReconnect(`junto_journal_replay saw stale session_id (${errText})`)
+        }
+        return { content: [{ type: 'text', text: `junto_journal_replay: server error: ${errText}` }], isError: true }
+      }
       const text = (result.content as Array<{ type: string; text?: string }> | undefined)
         ?.find(c => c.type === 'text')?.text ?? ''
-      if (result.isError === true) {
-        if (/session.*not.*found/i.test(text)) {
-          forceReconnect(`junto_journal_replay saw stale session_id (${text})`)
-        }
-        return { content: [{ type: 'text', text: `junto_journal_replay: server error: ${text}` }], isError: true }
-      }
       // Success — remove the entry from the journal.
       journal.splice(idx, 1)
       persistJournal()
@@ -872,22 +905,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 
   try {
-    // Direct callTool (not callMemory) so we can inspect isError. A
-    // server-side "Session not found" comes back as isError=true and was
-    // previously parsed as a normal success body by callMemory, leaking
-    // the error to the caller as if it were the send result.
+    // Direct callTool (not callMemory) so we can inspect both error shapes
+    // the server uses (isError=true AND "ERROR:"-prefixed text without
+    // isError). v0.0.21: route through unwrapToolError so a stale session
+    // is always detected and queued for reconnect; the prior isError-only
+    // check missed the more common ERROR-text variant entirely, letting
+    // a pinned-sessionId plugin keep silently returning errors to the
+    // caller without ever attempting to rebind.
     const result = await sm.callTool({
       name: 'memory_send_message',
       arguments: { session_id: sessionId, ...sendArgs },
     })
-    const content = result.content as Array<{ type: string; text?: string }> | undefined
-    const text = content?.find(c => c.type === 'text')?.text ?? ''
-    if (result.isError === true) {
+    const errText = unwrapToolError(result)
+    if (errText !== null) {
       // Stale session — null id, kick supervisor, AND queue the message so
       // it actually goes out once the rebind completes. Prior versions
       // dropped the message on the floor here.
-      if (/session.*not.*found/i.test(text)) {
-        forceReconnect(`send_message saw stale session_id (${text})`)
+      if (/session.*not.*found/i.test(errText)) {
+        forceReconnect(`send_message saw stale session_id (${errText})`)
         const q = enqueueJournal(SEND_MESSAGE_TOOL, sendArgs)
         if (q) {
           return {
@@ -903,8 +938,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           }
         }
       }
-      return { content: [{ type: 'text', text: `send_message: ${text}` }], isError: true }
+      return { content: [{ type: 'text', text: `send_message: ${errText}` }], isError: true }
     }
+    const content = result.content as Array<{ type: string; text?: string }> | undefined
+    const text = content?.find(c => c.type === 'text')?.text ?? ''
     return { content: [{ type: 'text', text }] }
   } catch (err) {
     // Transport-level failure (VPN dropped mid-call). Queue rather than lose.
@@ -1063,18 +1100,20 @@ function stopHeartbeat(): void {
 }
 
 // Calls memory_heartbeat directly (not through callMemory) so we can inspect
-// the MCP isError flag — a "Session not found" comes back as an isError result,
-// not a thrown exception. Throws on transport-level errors and on isError=true.
+// both error shapes the server uses. v0.0.21: a "Session not found" comes
+// back as content text starting with "ERROR:" without the MCP isError flag
+// being set, so we route the response through unwrapToolError to catch
+// both isError=true AND the ERROR-text-prefix variant. Throws on either
+// signal AND on transport-level errors.
 async function heartbeatOnce(): Promise<void> {
   if (!sm || !sessionId) throw new Error('heartbeat: no bound session')
   const res = await sm.callTool({
     name: 'memory_heartbeat',
     arguments: { session_id: sessionId },
   })
-  if (res.isError === true) {
-    const text = (res.content as Array<{ type: string; text?: string }> | undefined)
-      ?.find(c => c.type === 'text')?.text
-    throw new Error(`memory_heartbeat error: ${text ?? '(no body)'}`)
+  const errText = unwrapToolError(res)
+  if (errText !== null) {
+    throw new Error(`memory_heartbeat error: ${errText}`)
   }
 }
 
@@ -1134,7 +1173,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.20' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.21' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })

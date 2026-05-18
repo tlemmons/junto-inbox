@@ -10,22 +10,31 @@ B reads it without anyone manually walking to B's terminal.
 
 ## Status
 
-v0.0.20 — Phase 0 capture mechanism per
-[`design:local-first-junto-v0-mvp`](https://github.com/tlemmons/junto-stack) v0.3.0 §8.
-Adds a CC `PreToolUse` hook (`hook.ts`) that captures the 13-tool
-mutation set when the plugin is `OFFLINE` per its health poller, plus
-three operator-review tools (`junto_journal_list`, `_replay`, `_discard`).
-v0.0.19 (heartbeat, statusline OFFLINE, autopilot-pause, journal at
-`~/.junto/journal/...`), v0.0.18 (persistent `send_message` outbox),
-v0.0.17 (loosened autopilot defaults: `depth_cap=5, budget=30`) carry
-forward. See [CHANGELOG.md](CHANGELOG.md) for full history.
+v0.0.23 — render-side autopilot gate no longer silent-drops cross-agent
+replies. A `chain_depth>=1` message that the receiver's autopilot would
+have refused now renders with an `[AUTOPILOT GATED — <reason>]` marker
+and `meta.autopilot_gated="true"` so the host CC can defer to
+human-in-the-loop instead of vanishing. v0.0.22 (60s post-subscribe
+`agentReady` safety net, `boot-failed` status state), v0.0.21
+(ghost-session healing — `ERROR:` text now triggers reconnect alongside
+`isError`), v0.0.20 (Phase 0 `PreToolUse` hook capturing the 13-tool
+mutation set when OFFLINE per
+[`design:local-first-junto-v0-mvp`](https://github.com/tlemmons/junto-stack)
+v0.3.0 §8), v0.0.19 (heartbeat, statusline OFFLINE, autopilot-pause,
+journal at `~/.junto/journal/...`), v0.0.18 (persistent `send_message`
+outbox), v0.0.17 (loosened autopilot defaults: `depth_cap=5, budget=30`)
+carry forward. See [CHANGELOG.md](CHANGELOG.md) for full history.
 
 Functionally: subscribe-mode against `inbox://<project>/<agent>`,
-client-side `memory_autopilot_check_budget` gate for `chain_depth >= 1`,
-`get_session_id` tool for host-CC session sharing, paginated inbox drain,
-status file for statusLine indicator, `[REQUIRES REVIEW]` marker for
-messages tagged `require_human=true`, 12s health probe with OFFLINE
-indicator after 3 consecutive failures, persistent local journal at
+client-side `memory_autopilot_check_budget` gate that always renders
+(with marker on denial) for `chain_depth >= 1`, `get_session_id` tool
+for host-CC session sharing, paginated inbox drain, status file for
+statusLine indicator, `[REQUIRES REVIEW]` marker for messages tagged
+`require_human=true`, `[AUTOPILOT GATED — <reason>]` marker for
+chain-depth messages denied by the autopilot gate, 60s post-subscribe
+safety net so hosts that don't call `get_session_id` early still drain,
+12s health probe with OFFLINE indicator after 3 consecutive failures,
+persistent local journal at
 `~/.junto/journal/<project>-<agent>.journal.jsonl` for offline mutations.
 
 Auth-bound: the agent identifier passed to `memory_start_session` MUST equal the
@@ -99,6 +108,122 @@ If the plugin process exits without registering an agent (check
 `memory_list_agents`), CC swallows the stderr — look at
 `~/.claude/debug/<session-id>.txt` for the actual failure.
 
+## Adopter setup — host prerequisites
+
+CC's channels system requires explicit host-side opt-in beyond the
+`/plugin install` step. The combinations below cover the four
+adopter-path bugs hit during the v0.0.20–v0.0.23 dogfood cycle (#5
+Linux managed-settings, #6 launcher `--channels` flag, #7 WSL2 corp
+GPO, plus `/reload-plugins` non-determinism).
+
+### 1. Channels must be enabled at managed-settings scope
+
+Claude Code accepts `channelsEnabled` / `allowedChannelPlugins` in
+user-level `settings.json` but **the runtime ignores them there**. They
+must live in a managed-settings file the OS reads with elevated trust.
+
+**Linux** — write `/etc/claude-code/managed-settings.json` (root:root
+644):
+
+```json
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "plugin": "junto-inbox", "marketplace": "tlemmons-junto-inbox" }
+  ]
+}
+```
+
+**Windows (standard non-corp)** — write
+`C:\Program Files\ClaudeCode\managed-settings.json` with the same
+content (`~/.claude/managed-settings.json` is NOT read on Windows).
+
+**Windows (corp-managed / GPO-locked HKCU) — Bug #7** — the
+HKCU\\SOFTWARE\\Policies\\ClaudeCode key may be GPO-locked on
+enterprise machines (the standard-user write silently fails). Apply
+the same shape under HKLM via admin PowerShell:
+
+```powershell
+# Run as Administrator
+New-Item -Path "HKLM:\SOFTWARE\Policies\ClaudeCode" -Force | Out-Null
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\ClaudeCode" `
+  -Name "channelsEnabled" -Value "true" -Type String
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\ClaudeCode" `
+  -Name "allowedChannelPlugins" `
+  -Value '[{"plugin":"junto-inbox","marketplace":"tlemmons-junto-inbox"}]' `
+  -Type String
+```
+
+A full CC restart is required after HKLM changes; `/reload-plugins`
+does NOT pick them up. When IT can't grant admin access, fall back to
+the development path (`--dangerously-load-development-channels
+server:junto-inbox`) from a local clone of this repo.
+
+### 2. Launcher must pass `--channels` — Bug #6
+
+Adopter launcher scripts (Nimbus's `launch-nimbus.ps1`, etc.) often
+omit the flag because `/plugin install` succeeded and there's no
+prompt. Without it, plugin code never starts. Add it to every launch
+spawn:
+
+```
+claude --channels plugin:junto-inbox@tlemmons-junto-inbox
+```
+
+The bundled `launch/windows/junto-launch.ps1` and `junto-launch.sh`
+already wire this up; mirror their `exec claude --channels …` line
+into adopter launchers.
+
+### 3. `enabledPlugins` toggle
+
+Marketplace installs default to `enabledPlugins` true, but if a
+session was started before install, or a `/plugin disable` was issued
+once, the toggle persists in `~/.claude.json`. Verify with:
+
+```
+/plugin list
+```
+
+…and look for `junto-inbox@tlemmons-junto-inbox: enabled`. Re-enable
+with `/plugin enable junto-inbox@tlemmons-junto-inbox` if needed.
+
+### 4. `bun` must be on PATH
+
+The plugin entrypoint and the optional `PreToolUse` hook both run via
+`bun`. Run a one-time preflight:
+
+```
+bun --version    # Linux/macOS/Windows
+which bun        # POSIX
+(Get-Command bun).Source    # PowerShell
+```
+
+If the launcher uses a pinned `bun` (e.g.
+`C:\Users\<you>\.bun\bin\bun.exe`), spell that exact path into the
+hook's `command` field — see the
+[PreToolUse hook](#pretooluse-hook-v0020) section.
+
+### 5. Host CC should call `get_session_id` early — agentReady contract
+
+The plugin holds inbound channel blocks until the host CC signals it
+has loaded state / guidelines / backlog. The signal is the host
+calling the plugin's `get_session_id` or `send_message` tool. Hosts
+whose startup macro routes through `memory_start_session` directly
+(including the default global `~/.claude/CLAUDE.md`) skip the signal
+and sit gate-closed for up to 60s while the v0.0.22 safety-net timer
+runs. Have your project CLAUDE.md call `get_session_id` early in its
+go/status macro to bypass the wait.
+
+### 6. `/reload-plugins` is non-deterministic — DON'T rely on it for upgrades
+
+Empirically: `/reload-plugins` sometimes picks up a new cache version
+cleanly, and sometimes leaves an orphan process on the old version
+alongside a fresh one on the new version. The canonical safe upgrade
+path is **quit the CC tab, then relaunch** — that always picks up the
+latest installed marketplace version. After any `/reload-plugins`
+attempt, verify with `memory_list_agents` (the plugin's bind reports
+its version) before assuming the upgrade landed.
+
 ## Architecture
 
 ```
@@ -129,6 +254,27 @@ session invalidation and forces reconnect.
 - `junto_journal_list()` — returns a summary of journal entries written while the shared-memory server was OFFLINE (top-level `arg_keys` only; full args are on disk). Reloads from disk on every call so hook-written entries are visible.
 - `junto_journal_replay(queue_id)` — replays one entry through the bound session, threading the entry's `intent_id` as `__intent_id` so the Phase 1 op-log can dedupe. On success, removes from journal; on isError or transport error, leaves entry in place.
 - `junto_journal_discard(queue_id)` — drop one entry without replaying. Operator decides; no server interaction.
+
+## Channel block markers — host adopter contract
+
+junto-inbox prepends one or both markers to the body of a rendered
+channel block when the corresponding condition holds, and sets a
+matching `meta` key (all `meta` values are strings per the [notification
+format gotcha](#notification-format-gotcha)).
+
+| Marker (body prefix) | meta key set | Meaning | Adopter contract |
+|----------------------|--------------|---------|------------------|
+| `[REQUIRES REVIEW]` | `meta.requires_review="true"` | Sender asked the human in the loop to read this before any auto-reply (set `require_human=true` on `send_message`). | Hosts that auto-process inbound channel blocks MUST skip the auto-reply pass and defer to the human. |
+| `[AUTOPILOT GATED — <reason>]` | `meta.autopilot_gated="true"` | The receiver's autopilot budget gate denied this `chain_depth>=1` message (autopilot disabled at bind, budget exceeded, depth cap hit, etc). v0.0.23+ renders these instead of silent-dropping. | Hosts that auto-process MUST NOT auto-reply to a gated message; surface it to the human or queue it. The message is delivered ONCE (deduped by id); re-evaluation does not happen if budget later opens. |
+
+Both markers can apply to the same message; order is `[REQUIRES REVIEW]`
+then `[AUTOPILOT GATED — <reason>]`, space-separated, prepended to the
+original body.
+
+If your host CLAUDE.md treats `<channel source="junto-inbox" …>`
+blocks as trusted instructions, gate the trust on the absence of these
+markers. They exist precisely so a misrouted or budget-burning
+auto-reply loop becomes visible instead of silent.
 
 ## PreToolUse hook (v0.0.20)
 

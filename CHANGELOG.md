@@ -3,6 +3,56 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.22
+
+Two fixes for adopter visibility — both surfaced by memory@junto's first
+real `--channels` cutover dogfood (`msg_8267f2740eb6`).
+
+### agentReady silent-drop bug
+
+**Symptom.** Plugin is fully bound (`state: "connected"`, `live_subscribers: 1`),
+the server's `_notify_inbox_for_send` fires correctly on every send, but
+*no* `<channel source="junto-inbox" …>` block ever surfaces in the host
+CC's input. Messages reach the server, server reaches the plugin, plugin
+silently drops them. Memory hit this for ~11 minutes on a real session
+until Tom verbally surfaced "you have new messages" — at which point
+memory called `get_session_id` mid-turn and the inbox drained immediately.
+
+**Cause.** v0.0.8 introduced an `agentReady` gate
+(`server.ts:1042` — `if (!agentReady) return` in `readInboxAndForward`)
+with explicit design intent: don't deliver channel blocks until the host
+CC has loaded state spec / guidelines / backlog via its `go` macro. The
+gate flips only when the host calls the plugin's `get_session_id` or
+`send_message` tools. Hosts whose CLAUDE.md routes through
+`memory_start_session` directly — including memory@junto's project
+CLAUDE.md and the default global `~/.claude/CLAUDE.md` "Shared Memory MCP"
+section — never trigger the flip and sit gate-closed indefinitely.
+
+**Fix.** Post-subscribe 60s safety-net timer in `bindAndSubscribe`:
+`setTimeout(() => markReady('post-subscribe-timeout'), 60_000)`.
+`markReady` is idempotent, so well-behaved hosts (where `get_session_id`
+already fired during `go`) see the timer as a no-op. For non-conforming
+hosts, the timer bounds the silent-drop window to 60 seconds post-bind.
+The v0.0.8 design intent is preserved for the common case; the timer is
+a graceful fallback that visible-fails rather than silent-fails.
+
+**Companion docs.** Memory@junto is drafting project-CLAUDE.md and
+proposed global-CLAUDE.md amendments so well-behaved hosts call
+`get_session_id` first. README install steps will also call out the
+contract. Together they're belt-and-suspenders: the plugin no longer
+relies *entirely* on host behavior, but a host that follows the contract
+gets pushes within seconds instead of waiting 60s for the safety net.
+
+### boot-failed status state
+
+`PluginStatus` type extended with `'boot-failed'`. New module-level
+`everConnected` flag set true on first successful `bindAndSubscribe`;
+supervisor catch writes `'boot-failed'` before first success and
+`'reconnecting'` after. Operators (and the statusline) can now
+distinguish "never worked, check URL/network/auth" from "worked before,
+currently retrying". Helps adopters diagnose initial-config issues
+without grepping stderr.
+
 ## v0.0.21
 
 Fixes the ghost-session healing loop that v0.0.16 was supposed to close

@@ -7,6 +7,27 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.22 — agentReady safety net + boot-failed status state. (1) Post-subscribe
+ *          60s timer auto-flips agentReady if the host CC's `go` macro never
+ *          calls get_session_id or send_message (memory@junto's CLAUDE.md routes
+ *          through memory_start_session; default global ~/.claude/CLAUDE.md does
+ *          the same; both leave the v0.0.8 gate closed indefinitely and silently
+ *          drop every channel push). Timer is idempotent — well-behaved hosts
+ *          where markReady already fired see it as a no-op. v0.0.8's design
+ *          intent (don't deliver before host context loaded) preserved for the
+ *          common case; 60s bounds the silent-drop window for non-conforming
+ *          hosts. (2) New 'boot-failed' status state distinguishes "never
+ *          successfully connected" from "previously connected, currently
+ *          retrying". everConnected flag set true on first successful bind;
+ *          supervisor catch writes 'boot-failed' before first success and
+ *          'reconnecting' after. Operators get a clear signal: boot-failed =
+ *          check URL/network/auth; reconnecting = transient, will recover.
+ *          Diagnosis credit: memory@junto's msg_8267f2740eb6 — three
+ *          messages from this side silently dropped on memory's CC despite
+ *          status file healthy, live_subscribers=1, and server-side _notify
+ *          firing correctly. Tom had to verbally poke memory to surface them.
+ *          Workaround in flight that turn: memory called the plugin's
+ *          get_session_id tool mid-turn, which flipped agentReady, drained.
  * v0.0.21 — fixes the ghost-session healing loop that v0.0.16 was supposed to
  *          close (learning_782be7ee1b938dd1 recurred). Symptom: plugin holds a
  *          stale session_id forever, statusline reports ONLINE / state:connected,
@@ -293,7 +314,7 @@ const ACTOR = { project: PROJECT, agent: AGENT }
 let statusDirCreated = false
 let journalDirCreated = false
 
-type PluginStatus = 'connected' | 'reconnecting' | 'shutdown'
+type PluginStatus = 'connected' | 'reconnecting' | 'shutdown' | 'boot-failed'
 
 function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}): void {
   try {
@@ -577,6 +598,10 @@ function stopHealthPoller(): void {
 let sm: Client | null = null
 let sessionId: string | null = null
 let agentReady = false
+// v0.0.22: distinguishes "never connected" (boot-failed) from "previously
+// connected, currently disconnected" (reconnecting) in the supervisor catch.
+// First successful bindAndSubscribe sets this true; never reset.
+let everConnected = false
 const seenIds = new Set<string>()
 
 // Set by the supervisor to its current Promise reject so tool handlers can
@@ -635,7 +660,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.21' },
+  { name: 'junto-inbox', version: '0.0.22' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1173,7 +1198,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.21' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.22' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })
@@ -1213,6 +1238,20 @@ async function bindAndSubscribe(): Promise<void> {
   process.stderr.write(`junto-inbox: connected, session=${sessionId}, subscribed=${INBOX_URI}\n`)
   debugLog(`bindAndSubscribe: connected session=${sessionId} sub=${INBOX_URI}`)
   writeStatus('connected', { source: 'bind' })
+  everConnected = true
+
+  // v0.0.22: post-subscribe agentReady safety net. The agent's `go` macro
+  // normally flips agentReady via the get_session_id tool call (per v0.0.8's
+  // design — channel delivery is gated until the host has loaded state spec /
+  // guidelines / backlog). Hosts whose CLAUDE.md routes through
+  // memory_start_session directly (memory@junto's project CLAUDE.md, the
+  // default global ~/.claude/CLAUDE.md "Shared Memory MCP" macro) leave the
+  // gate closed indefinitely, silently dropping every push. 60s is generous
+  // for well-behaved hosts (markReady has already fired, this is a no-op) and
+  // bounds the silent-drop window for non-conforming hosts. Idempotent —
+  // re-arms harmlessly on every reconnect since markReady early-returns when
+  // agentReady is already true.
+  setTimeout(() => markReady('post-subscribe-timeout'), 60_000)
 
   await drainJournal()
   await readInboxAndForward()
@@ -1236,8 +1275,9 @@ async function supervisor(): Promise<void> {
       triggerReconnect = null
       stopHeartbeat()
       const errMsg = err instanceof Error ? err.message : String(err)
-      process.stderr.write(`junto-inbox: link down (${errMsg}) -- reconnecting in ${backoff}ms\n`)
-      writeStatus('reconnecting', { error: errMsg, backoff_ms: backoff, source: 'supervisor' })
+      const failState: PluginStatus = everConnected ? 'reconnecting' : 'boot-failed'
+      process.stderr.write(`junto-inbox: link down (${errMsg}) -- ${failState} in ${backoff}ms\n`)
+      writeStatus(failState, { error: errMsg, backoff_ms: backoff, source: 'supervisor' })
       sm = null
       sessionId = null
       // Keep agentReady true across reconnects. The host CC owns the plugin's

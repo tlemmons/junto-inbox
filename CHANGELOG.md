@@ -3,6 +3,62 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.23
+
+Render-side autopilot gate no longer silent-drops cross-agent replies.
+
+### Symptom
+
+A chain_depth>=1 message arriving while the receiver's autopilot is
+disabled or budget-exceeded never surfaces in the host CC's input. The
+message is in MongoDB (`status:pending`, `delivered:false`), the plugin
+process is bound and subscribed (`live_subscribers >= 1`), `_notify_inbox_for_send`
+on the server fires correctly — and nothing renders. Only an invisible
+stderr line at server.ts:1014 records the drop.
+
+Empirically caught by memory@junto on 2026-05-18: their fresh post-restart
+bind rendered two self-sent probes (chain_depth=0, bypass the gate) but
+did NOT render an inbound reply at chain_depth=2 from this agent. The
+v0.0.22 60s safety net fired correctly; the autopilot gate then silently
+swallowed the depth-2 message. Pre-existing in v0.0.21 and earlier;
+caught now because the v0.0.22 safety-net fix exposed cross-agent
+replies that previously never made it past the agentReady gate either.
+
+### Cause
+
+`deliverNew` at server.ts:1004 calls `memory_autopilot_check_budget` for
+chain_depth>=1 messages. On `allowed=false` the loop did `continue`
+without `seenIds.add(id)` — so the message was both undelivered and
+re-evaluated on every poll. If autopilot was disabled at bind (and no
+event flipped it on later), the loop continued forever. If the budget
+flipped back to allowed mid-flight, the message would suddenly deliver
+without any indicator it had been gated. Both outcomes are bad UX.
+
+The deeper issue is concern-mixing: the receiver-side gate was acting
+as both a render decision AND an auto-reply decision. Auto-reply belongs
+on the send side (server enforces via `memory_send_message` accounting +
+the `enabled=False` flip); render should be unconditional so the
+human-in-the-loop can manually act.
+
+### Fix
+
+Render either way. Always `seenIds.add(id)`. On gate denial, prepend a
+`[AUTOPILOT GATED — <reason>]` marker (alongside the existing
+`[REQUIRES REVIEW]` marker if both apply) and emit
+`meta.autopilot_gated="true"` so the host CC knows not to auto-reply.
+Stderr log unchanged. Server-side send-time budget enforcement is the
+correct boundary and is unchanged.
+
+### Adopter notes
+
+- Hosts that auto-process inbound channel blocks should check
+  `meta.autopilot_gated`; if `"true"`, skip the auto-reply pass and
+  defer to human-in-the-loop.
+- This is a renderer change only — no migration, no env vars, no
+  contract change with the shared-memory server.
+- Cosmetic: also bumps the `junto-inbox-health` Client version string
+  at server.ts:516 from `'0.0.21'` to `'0.0.23'` (was missed in v0.0.22).
+
 ## v0.0.22
 
 Two fixes for adopter visibility — both surfaced by memory@junto's first

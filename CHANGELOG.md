@@ -3,6 +3,61 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.24
+
+Track the junto MCP server's `shared_memory` → `junto` `serverInfo.name`
+rename (Phase 2 client-label edits). All tool-prefix constants in
+`schema.ts` flip from `mcp__shared-memory__memory_*` to
+`mcp__junto__memory_*`. Wire protocol, URL, and tool argument shapes
+unchanged; this is a label-only cut on the plugin side.
+
+### Schema changes (`schema.ts`)
+
+- `SEND_MESSAGE_TOOL` constant.
+- All 13 entries in `CAPTURE_SET`.
+- All 23 entries in `DENY_LIST`.
+- All 13 keys of `TOOL_OP_TYPE_MAP`.
+- Header doc comment.
+
+### Backward compat for pre-v0.0.24 journal entries
+
+A journal entry written by a v0.0.23-or-earlier hook on disk has
+`tool_name` stored with the legacy `mcp__shared-memory__` prefix.
+Two paths handle the version skew:
+
+1. **`normalizeLegacyEntry` (`schema.ts`)** forward-ports the
+   `tool_name` prefix from `mcp__shared-memory__` to `mcp__junto__`
+   on load. Downstream code (TOOL_OP_TYPE_MAP lookup, replay path)
+   sees only the current prefix.
+2. **Replay strip regex (`server.ts:845`)** accepts either prefix:
+   `/^mcp__(junto|shared-memory)__/`. Belt-and-suspenders for any
+   entry that bypasses `normalizeLegacyEntry` (unlikely — every load
+   path funnels through it — but cheap insurance).
+
+No journal-on-disk migration needed. Operators with no pre-v0.0.24
+entries on disk (Windows hosts where the hook was deferred per
+`launch-nimbus.ps1:73-75`) get a no-op.
+
+### Adopter action required
+
+When upgrading from v0.0.23, also flip the PreToolUse hook matcher in
+`.claude/settings.json` (per-agent or per-project) from
+`mcp__shared-memory__memory_*` to `mcp__junto__memory_*`. Without that
+flip the hook silently no-ops post-rename — graceful-degradation
+behavior (`send_message` is still journaled by the plugin's own
+handler) but the other 12 capture-set tools fall through to the live
+MCP path.
+
+The Linux `launch/linux/junto-launch.sh` rewires the matcher on next
+launch (it merges the hook block from scratch); Windows hosts have
+the hook deferred so no action there until/unless the hooks-publishing
+gate (`launch-nimbus.ps1:73-75`) resolves.
+
+### Server.ts version bumps
+
+`junto-inbox`, `junto-inbox-health`, and `junto-inbox-client` MCP
+Client name strings bumped from `'0.0.23'` to `'0.0.24'`.
+
 ## v0.0.23
 
 Render-side autopilot gate no longer silent-drops cross-agent replies.

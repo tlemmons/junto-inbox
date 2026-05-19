@@ -4,7 +4,7 @@
  * Imported by both the plugin (server.ts) and the PreToolUse hook script
  * (hook.ts) so they agree on:
  *   - the journal-entry shape (`design:local-first-junto-v0-mvp` v0.3.0 §8 v1)
- *   - which `mcp__shared-memory__memory_*` tool calls are captured vs denied
+ *   - which `mcp__junto__memory_*` tool calls are captured vs denied
  *   - the §4.1 op_type mapping for each captured tool
  *   - the canonical file paths (status file + journal file)
  *
@@ -19,7 +19,7 @@ import { randomUUID } from 'crypto'
 
 export const JOURNAL_SCHEMA_VERSION = 1
 
-export const SEND_MESSAGE_TOOL = 'mcp__shared-memory__memory_send_message'
+export const SEND_MESSAGE_TOOL = 'mcp__junto__memory_send_message'
 
 /**
  * The 13 mutation tools the inbox plugin is responsible for journaling when
@@ -27,19 +27,19 @@ export const SEND_MESSAGE_TOOL = 'mcp__shared-memory__memory_send_message'
  * set MUST also appear in TOOL_OP_TYPE_MAP.
  */
 export const CAPTURE_SET = new Set<string>([
-  'mcp__shared-memory__memory_send_message',
-  'mcp__shared-memory__memory_record_learning',
-  'mcp__shared-memory__memory_store',
-  'mcp__shared-memory__memory_define_spec',
-  'mcp__shared-memory__memory_register_function',
-  'mcp__shared-memory__memory_enrich_function',
-  'mcp__shared-memory__memory_add_backlog_item',
-  'mcp__shared-memory__memory_batch_backlog',
-  'mcp__shared-memory__memory_update_backlog_item',
-  'mcp__shared-memory__memory_complete_backlog_item',
-  'mcp__shared-memory__memory_change_status',
-  'mcp__shared-memory__memory_archive_by_tag',
-  'mcp__shared-memory__memory_restore_by_tag',
+  'mcp__junto__memory_send_message',
+  'mcp__junto__memory_record_learning',
+  'mcp__junto__memory_store',
+  'mcp__junto__memory_define_spec',
+  'mcp__junto__memory_register_function',
+  'mcp__junto__memory_enrich_function',
+  'mcp__junto__memory_add_backlog_item',
+  'mcp__junto__memory_batch_backlog',
+  'mcp__junto__memory_update_backlog_item',
+  'mcp__junto__memory_complete_backlog_item',
+  'mcp__junto__memory_change_status',
+  'mcp__junto__memory_archive_by_tag',
+  'mcp__junto__memory_restore_by_tag',
 ])
 
 /**
@@ -51,32 +51,32 @@ export const CAPTURE_SET = new Set<string>([
  * we match by the tool name itself, not regex over its semantics.
  */
 export const DENY_LIST = new Set<string>([
-  'mcp__shared-memory__memory_query',
-  'mcp__shared-memory__memory_search_global',
-  'mcp__shared-memory__memory_find_function',
-  'mcp__shared-memory__memory_health',
-  'mcp__shared-memory__memory_autopilot_status',
-  'mcp__shared-memory__memory_autopilot_count',
-  'mcp__shared-memory__memory_autopilot_check_budget',
-  'mcp__shared-memory__memory_autopilot_digest',
-  'mcp__shared-memory__memory_checklist',
-  'mcp__shared-memory__memory_db',
+  'mcp__junto__memory_query',
+  'mcp__junto__memory_search_global',
+  'mcp__junto__memory_find_function',
+  'mcp__junto__memory_health',
+  'mcp__junto__memory_autopilot_status',
+  'mcp__junto__memory_autopilot_count',
+  'mcp__junto__memory_autopilot_check_budget',
+  'mcp__junto__memory_autopilot_digest',
+  'mcp__junto__memory_checklist',
+  'mcp__junto__memory_db',
   // get_* family (read-only)
-  'mcp__shared-memory__memory_get_messages',
-  'mcp__shared-memory__memory_get_spec',
-  'mcp__shared-memory__memory_get_by_id',
-  'mcp__shared-memory__memory_get_active_work',
-  'mcp__shared-memory__memory_get_agent_status',
-  'mcp__shared-memory__memory_get_enrichment_queue',
-  'mcp__shared-memory__memory_get_locks',
+  'mcp__junto__memory_get_messages',
+  'mcp__junto__memory_get_spec',
+  'mcp__junto__memory_get_by_id',
+  'mcp__junto__memory_get_active_work',
+  'mcp__junto__memory_get_agent_status',
+  'mcp__junto__memory_get_enrichment_queue',
+  'mcp__junto__memory_get_locks',
   // list_* family (read-only)
-  'mcp__shared-memory__memory_list_agents',
-  'mcp__shared-memory__memory_list_backlog',
-  'mcp__shared-memory__memory_list_projects',
-  'mcp__shared-memory__memory_list_specs',
+  'mcp__junto__memory_list_agents',
+  'mcp__junto__memory_list_backlog',
+  'mcp__junto__memory_list_projects',
+  'mcp__junto__memory_list_specs',
   // misc read
-  'mcp__shared-memory__memory_project',
-  'mcp__shared-memory__memory_guidelines',
+  'mcp__junto__memory_project',
+  'mcp__junto__memory_guidelines',
 ])
 
 /**
@@ -97,19 +97,19 @@ export const DENY_LIST = new Set<string>([
  *     emits one entry per added item).
  */
 export const TOOL_OP_TYPE_MAP: Record<string, string> = {
-  'mcp__shared-memory__memory_send_message': 'message.sent',
-  'mcp__shared-memory__memory_record_learning': 'learning.recorded',
-  'mcp__shared-memory__memory_store': 'store.created',
-  'mcp__shared-memory__memory_define_spec': 'spec.updated',
-  'mcp__shared-memory__memory_register_function': 'function.registered',
-  'mcp__shared-memory__memory_enrich_function': 'function.enriched',
-  'mcp__shared-memory__memory_add_backlog_item': 'backlog.added',
-  'mcp__shared-memory__memory_batch_backlog': 'backlog.added',
-  'mcp__shared-memory__memory_update_backlog_item': 'backlog.updated',
-  'mcp__shared-memory__memory_complete_backlog_item': 'backlog.updated',
-  'mcp__shared-memory__memory_change_status': 'learning.superseded',
-  'mcp__shared-memory__memory_archive_by_tag': 'store.tagged',
-  'mcp__shared-memory__memory_restore_by_tag': 'store.tagged',
+  'mcp__junto__memory_send_message': 'message.sent',
+  'mcp__junto__memory_record_learning': 'learning.recorded',
+  'mcp__junto__memory_store': 'store.created',
+  'mcp__junto__memory_define_spec': 'spec.updated',
+  'mcp__junto__memory_register_function': 'function.registered',
+  'mcp__junto__memory_enrich_function': 'function.enriched',
+  'mcp__junto__memory_add_backlog_item': 'backlog.added',
+  'mcp__junto__memory_batch_backlog': 'backlog.added',
+  'mcp__junto__memory_update_backlog_item': 'backlog.updated',
+  'mcp__junto__memory_complete_backlog_item': 'backlog.updated',
+  'mcp__junto__memory_change_status': 'learning.superseded',
+  'mcp__junto__memory_archive_by_tag': 'store.tagged',
+  'mcp__junto__memory_restore_by_tag': 'store.tagged',
 }
 
 export type JournalEntry = {
@@ -187,6 +187,14 @@ export function normalizeLegacyEntry(
     } else {
       return null
     }
+  }
+  // v0.0.24: server renamed from shared_memory → junto. Forward-port any
+  // pre-v0.0.24 journal entries whose tool_name was captured with the old
+  // mcp__shared-memory__ prefix so TOOL_OP_TYPE_MAP lookups and replay both
+  // see the current prefix. server.ts:845 also accepts either prefix during
+  // replay; this normalization keeps the rest of the load-path single-prefix.
+  if (toolName.startsWith('mcp__shared-memory__')) {
+    toolName = 'mcp__junto__' + toolName.slice('mcp__shared-memory__'.length)
   }
   if (!opType) opType = TOOL_OP_TYPE_MAP[toolName] ?? 'audit.event'
 

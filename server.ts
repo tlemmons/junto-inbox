@@ -7,6 +7,19 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.24 — schema.ts tool-prefix rename to track the junto MCP server's
+ *          shared_memory → junto serverInfo rename (Phase 2 client-label edits).
+ *          CAPTURE_SET, DENY_LIST, TOOL_OP_TYPE_MAP, and SEND_MESSAGE_TOOL all
+ *          flip from mcp__shared-memory__memory_* to mcp__junto__memory_*. The
+ *          journal-replay path at line 845 now strips either prefix so
+ *          pre-v0.0.24 entries on disk remain replayable. normalizeLegacyEntry
+ *          maps legacy tool_name strings forward to the new prefix on load so
+ *          TOOL_OP_TYPE_MAP lookups don't degrade to 'audit.event'. Adopters
+ *          must also flip the PreToolUse hook matcher in .claude/settings.json
+ *          from mcp__shared-memory__memory_* to mcp__junto__memory_*; without
+ *          that flip the hook silently no-ops post-rename (graceful
+ *          degradation — send_message is still journaled by the plugin's own
+ *          handler). Server wire protocol unchanged; URL unchanged.
  * v0.0.23 — render-side autopilot gate no longer silent-drops. deliverNew used
  *          to `continue` (skipping both seenIds.add and the channel emit) when
  *          memory_autopilot_check_budget returned allowed=false for a
@@ -527,7 +540,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.23' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.24' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -674,7 +687,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.23' },
+  { name: 'junto-inbox', version: '0.0.24' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -838,11 +851,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       return { content: [{ type: 'text', text: `junto_journal_replay: queue_id ${queueId} not found` }], isError: true }
     }
     const entry = journal[idx]
-    // Strip the mcp__shared-memory__ prefix to get the bare tool name the
-    // shared-memory MCP server actually exposes. The hook stores the full
-    // CC-visible tool_name so it survives across version-skew on adopter
-    // agents; the plugin's sm client uses the bare names.
-    const bareName = entry.tool_name.replace(/^mcp__shared-memory__/, '')
+    // Strip the mcp__junto__ (current) or mcp__shared-memory__ (pre-v0.0.24)
+    // prefix to get the bare tool name the junto MCP server actually exposes.
+    // The hook stores the full CC-visible tool_name so it survives across
+    // version-skew on adopter agents; the plugin's sm client uses the bare
+    // names. The legacy prefix branch keeps pre-rename journal entries
+    // replayable through v0.0.24+ plugins.
+    const bareName = entry.tool_name.replace(/^mcp__(junto|shared-memory)__/, '')
     try {
       const result = await sm.callTool({
         name: bareName,
@@ -1228,7 +1243,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.23' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.24' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })

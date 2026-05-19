@@ -7,6 +7,19 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.25 — autopilot decouple. Push-control v0 (memory commit e82214d, spec
+ *          design:push-control-v0 v1.1.0) moved the brake to the server send-side:
+ *          per-sender depth_cap / push_budget / hard_ceiling are evaluated at
+ *          send time, and the server-side delivery-time filter excludes
+ *          push-suppressed messages from the inbox-resource read response unless
+ *          the recipient's recency window is open. deliverNew no longer calls
+ *          memory_autopilot_check_budget, no longer prepends [AUTOPILOT GATED]
+ *          markers, and no longer emits meta.autopilot_gated. The memory_autopilot_*
+ *          → memory_push_* 30-day alias keeps any leftover v0.0.24 callers working;
+ *          v0.0.25 simply stops calling them. Also adds an opt-in [SYSTEM NOTICE]
+ *          marker driven by m.is_system_notice for distinct visual treatment of
+ *          system@junto's recovery notices (push-control §8). MCP Client name
+ *          version strings bumped 0.0.24 → 0.0.25 (3 sites).
  * v0.0.24 — schema.ts tool-prefix rename to track the junto MCP server's
  *          shared_memory → junto serverInfo rename (Phase 2 client-label edits).
  *          CAPTURE_SET, DENY_LIST, TOOL_OP_TYPE_MAP, and SEND_MESSAGE_TOOL all
@@ -540,7 +553,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.24' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.25' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -687,7 +700,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.24' },
+  { name: 'junto-inbox', version: '0.0.25' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1026,46 +1039,22 @@ async function deliverNew(messages: Array<Record<string, unknown>>) {
 
     const chainDepth = Number(m.chain_depth ?? 0)
     const requiresReview = m.require_human === true
+    const isSystemNotice = m.is_system_notice === true
 
-    // v0.0.23 — separate "should I render" from "should I auto-reply".
-    // chain_depth=0 → human-originated, no gate, render.
-    // chain_depth>=1 → consult the receiver's autopilot budget gate, but
-    // render either way. Pre-v0.0.23 silently `continue`'d on gate denial
-    // (and didn't even seenIds.add), so cross-agent replies arriving while
-    // autopilot was disabled or budget-exceeded never reached the host CC
-    // or its human-in-the-loop. On gate denial we now prepend a marker and
-    // emit meta.autopilot_gated=true so the receiver knows not to auto-reply
-    // but can still act manually. Server still flips enabled=False on
-    // budget breach via its own send-side accounting; the render-side gate
-    // is purely advisory.
-    let autopilotGated = false
-    let gateReason = ''
-    if (chainDepth >= 1) {
-      const gate = (await callMemory('memory_autopilot_check_budget', {
-        session_id: sessionId,
-        project: PROJECT,
-        agent: AGENT,
-        message_id: id,
-        chain_depth: chainDepth,
-        require_human: false,
-      })) as { allowed?: boolean; reason?: string } | null
-      if (gate?.allowed !== true) {
-        autopilotGated = true
-        gateReason = gate?.reason ?? 'denied'
-        process.stderr.write(`junto-inbox: msg ${id} (depth ${chainDepth}) autopilot-gated: ${gateReason}; rendering with marker\n`)
-      }
-    }
-
-    // v0.0.23: always seen + always render. Pre-v0.0.23 the denial path
-    // skipped seenIds.add so a denied message re-evaluated on every poll
-    // and would eventually be delivered un-marked if autopilot flipped on
-    // mid-flight — confusing. Marker-once-then-seen is cleaner.
+    // v0.0.25 — autopilot gate removed. Push-control v0 (memory commit e82214d)
+    // moved the brake server-side: senders are gated by depth_cap / push_budget /
+    // hard_ceiling at send time, and the server-side delivery-time filter excludes
+    // push-suppressed messages from the inbox-resource response unless the
+    // recipient's recency window is open (opened by memory_start_session for that
+    // agent, inbound sent_by_human=true, or outbound human_interacted=true).
+    // The plugin no longer makes a per-message check; whatever the server hands
+    // back, we render. Server's per-sender accounting is the authoritative gate.
     seenIds.add(id)
 
     const body = String(m.message ?? m.body ?? '')
     const markers: string[] = []
     if (requiresReview) markers.push('[REQUIRES REVIEW]')
-    if (autopilotGated) markers.push(`[AUTOPILOT GATED — ${gateReason}]`)
+    if (isSystemNotice) markers.push('[SYSTEM NOTICE]')
     const content = markers.length ? `${markers.join(' ')} ${body}` : body
 
     await mcp.notification({
@@ -1081,11 +1070,11 @@ async function deliverNew(messages: Array<Record<string, unknown>>) {
           priority: String(m.priority ?? 'normal'),
           ts: String(m.created ?? new Date().toISOString()),
           requires_review: String(requiresReview),
-          autopilot_gated: String(autopilotGated),
+          is_system_notice: String(isSystemNotice),
         },
       },
     })
-    debugLog(`deliverNew: emitted channel notif id=${id} depth=${chainDepth} review=${requiresReview} gated=${autopilotGated}`)
+    debugLog(`deliverNew: emitted channel notif id=${id} depth=${chainDepth} review=${requiresReview} system_notice=${isSystemNotice}`)
   }
 }
 
@@ -1243,7 +1232,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.24' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.25' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })

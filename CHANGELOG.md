@@ -3,6 +3,64 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.25
+
+Autopilot decouple. Push-control v0 (memory commit `e82214d`, spec
+`design:push-control-v0` v1.1.0) moved the per-message brake from the
+plugin to the server, and v0.0.25 stops calling it.
+
+### What changed in `deliverNew`
+
+Three deletions, one addition:
+
+1. **Removed** the `memory_autopilot_check_budget` call for
+   `chain_depth >= 1` messages. The server now gates sends with
+   per-sender `depth_cap` / `push_budget` / `hard_ceiling` and runs a
+   delivery-time filter on the inbox-resource read (suppressed
+   messages get excluded unless the recipient's recency window is
+   open — see push-control v1.1.0 §3).
+2. **Removed** the `[AUTOPILOT GATED — <reason>]` marker prepend. The
+   plugin renders whatever the server hands back, no per-message
+   marker.
+3. **Removed** `meta.autopilot_gated="true"` from the channel
+   notification metadata. Host CLAUDE.md prompts that match
+   `(autopilot|gated)` against the marker / meta now have nothing to
+   match — safe to drop the regex on the host side at adopter cadence
+   (cosmetic; no behavior change).
+4. **Added** an opt-in `[SYSTEM NOTICE]` marker driven by
+   `m.is_system_notice === true` and `meta.is_system_notice` on the
+   channel notification, for distinct visual treatment of
+   `system@junto`'s recovery notices (push-control v1.1.0 §8).
+   These notices always surface in the inbox read regardless of
+   recency window.
+
+The `memory_autopilot_*` → `memory_push_*` 30-day alias on the server
+side keeps any leftover v0.0.24 callers working; v0.0.25 simply stops
+calling them, so the alias is a no-op for adopters who upgrade
+straight to v0.0.25.
+
+### Marker matrix
+
+| Marker | meta key | Source |
+|--------|----------|--------|
+| `[REQUIRES REVIEW]` | `meta.requires_review="true"` | sender set `require_human=true` |
+| `[SYSTEM NOTICE]` | `meta.is_system_notice="true"` | server-emitted notice (e.g. push-control recovery from `system@junto`) |
+
+Both can apply; order is `[REQUIRES REVIEW]` then `[SYSTEM NOTICE]`,
+space-separated, prepended to the original body. The v0.0.23–v0.0.24
+`[AUTOPILOT GATED — <reason>]` row is gone.
+
+### Server.ts version bumps
+
+`junto-inbox`, `junto-inbox-health`, and `junto-inbox-client` MCP
+Client name strings bumped from `'0.0.24'` to `'0.0.25'`.
+
+### Adopter action
+
+None required. Host CLAUDE.md prompts that key off `autopilot_gated`
+or the `[AUTOPILOT GATED]` marker can drop those clauses at next
+edit; they will never match a v0.0.25 message.
+
 ## v0.0.24
 
 Track the junto MCP server's `shared_memory` → `junto` `serverInfo.name`

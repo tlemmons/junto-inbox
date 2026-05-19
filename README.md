@@ -10,32 +10,37 @@ B reads it without anyone manually walking to B's terminal.
 
 ## Status
 
-v0.0.23 — render-side autopilot gate no longer silent-drops cross-agent
-replies. A `chain_depth>=1` message that the receiver's autopilot would
-have refused now renders with an `[AUTOPILOT GATED — <reason>]` marker
-and `meta.autopilot_gated="true"` so the host CC can defer to
-human-in-the-loop instead of vanishing. v0.0.22 (60s post-subscribe
-`agentReady` safety net, `boot-failed` status state), v0.0.21
-(ghost-session healing — `ERROR:` text now triggers reconnect alongside
-`isError`), v0.0.20 (Phase 0 `PreToolUse` hook capturing the 13-tool
-mutation set when OFFLINE per
+v0.0.25 — autopilot decouple. Push-control v0 (`design:push-control-v0`
+v1.1.0) moved the per-message brake to the server: per-sender
+`depth_cap` / `push_budget` / `hard_ceiling` are evaluated at send time
+and the server-side delivery-time filter excludes push-suppressed
+messages from the inbox read unless the recipient's recency window is
+open. The plugin no longer calls `memory_autopilot_check_budget`, no
+longer prepends `[AUTOPILOT GATED]` markers, and no longer emits
+`meta.autopilot_gated`. New opt-in `[SYSTEM NOTICE]` marker (driven by
+`m.is_system_notice` and `meta.is_system_notice`) gives `system@junto`'s
+push-control recovery notices distinct visual treatment. v0.0.24
+(schema.ts tool-prefix rename to `mcp__junto__memory_*`), v0.0.23
+(render-side gate stopped silent-dropping — superseded by v0.0.25),
+v0.0.22 (60s post-subscribe `agentReady` safety net, `boot-failed`
+status state), v0.0.21 (ghost-session healing — `ERROR:` text now
+triggers reconnect alongside `isError`), v0.0.20 (Phase 0 `PreToolUse`
+hook capturing the 13-tool mutation set when OFFLINE per
 [`design:local-first-junto-v0-mvp`](https://github.com/tlemmons/junto-stack)
 v0.3.0 §8), v0.0.19 (heartbeat, statusline OFFLINE, autopilot-pause,
 journal at `~/.junto/journal/...`), v0.0.18 (persistent `send_message`
-outbox), v0.0.17 (loosened autopilot defaults: `depth_cap=5, budget=30`)
-carry forward. See [CHANGELOG.md](CHANGELOG.md) for full history.
+outbox) carry forward. See [CHANGELOG.md](CHANGELOG.md) for full
+history.
 
 Functionally: subscribe-mode against `inbox://<project>/<agent>`,
-client-side `memory_autopilot_check_budget` gate that always renders
-(with marker on denial) for `chain_depth >= 1`, `get_session_id` tool
-for host-CC session sharing, paginated inbox drain, status file for
-statusLine indicator, `[REQUIRES REVIEW]` marker for messages tagged
-`require_human=true`, `[AUTOPILOT GATED — <reason>]` marker for
-chain-depth messages denied by the autopilot gate, 60s post-subscribe
-safety net so hosts that don't call `get_session_id` early still drain,
-12s health probe with OFFLINE indicator after 3 consecutive failures,
-persistent local journal at
-`~/.junto/journal/<project>-<agent>.journal.jsonl` for offline mutations.
+`get_session_id` tool for host-CC session sharing, paginated inbox
+drain, status file for statusLine indicator, `[REQUIRES REVIEW]` marker
+for messages tagged `require_human=true`, `[SYSTEM NOTICE]` marker for
+messages tagged `is_system_notice=true`, 60s post-subscribe safety net
+so hosts that don't call `get_session_id` early still drain, 12s health
+probe with OFFLINE indicator after 3 consecutive failures, persistent
+local journal at `~/.junto/journal/<project>-<agent>.journal.jsonl` for
+offline mutations.
 
 Auth-bound: the agent identifier passed to `memory_start_session` MUST equal the
 URI's `<agent>` segment, otherwise subscribe raises and reads return
@@ -265,11 +270,13 @@ format gotcha](#notification-format-gotcha)).
 | Marker (body prefix) | meta key set | Meaning | Adopter contract |
 |----------------------|--------------|---------|------------------|
 | `[REQUIRES REVIEW]` | `meta.requires_review="true"` | Sender asked the human in the loop to read this before any auto-reply (set `require_human=true` on `send_message`). | Hosts that auto-process inbound channel blocks MUST skip the auto-reply pass and defer to the human. |
-| `[AUTOPILOT GATED — <reason>]` | `meta.autopilot_gated="true"` | The receiver's autopilot budget gate denied this `chain_depth>=1` message (autopilot disabled at bind, budget exceeded, depth cap hit, etc). v0.0.23+ renders these instead of silent-dropping. | Hosts that auto-process MUST NOT auto-reply to a gated message; surface it to the human or queue it. The message is delivered ONCE (deduped by id); re-evaluation does not happen if budget later opens. |
+| `[SYSTEM NOTICE]` | `meta.is_system_notice="true"` | A server-emitted notice (e.g. `system@junto`'s push-control recovery notice — see `design:push-control-v0` v1.1.0 §8). These messages are non-pushing-by-construction but always surface in inbox reads. v0.0.25+. | Hosts MUST treat as informational; never auto-reply. They are intended to be FOUND on the next normal inbox flush, not acted on. |
 
 Both markers can apply to the same message; order is `[REQUIRES REVIEW]`
-then `[AUTOPILOT GATED — <reason>]`, space-separated, prepended to the
-original body.
+then `[SYSTEM NOTICE]`, space-separated, prepended to the original
+body. The pre-v0.0.25 `[AUTOPILOT GATED — <reason>]` marker is removed;
+the send-side push-control brake replaces it (see
+`design:push-control-v0` v1.1.0).
 
 If your host CLAUDE.md treats `<channel source="junto-inbox" …>`
 blocks as trusted instructions, gate the trust on the absence of these

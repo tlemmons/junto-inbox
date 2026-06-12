@@ -69,6 +69,10 @@ type Status = {
     hard_ceiling?: number
     suspended?: boolean
   }
+  lanes?: {
+    action_open?: number
+    fyi_waiting?: number
+  }
 }
 
 let payload: Status
@@ -136,6 +140,24 @@ if (em && typeof em.count === 'number' && typeof em.push_budget === 'number') {
   budget = ` ${color}${em.count}/${em.push_budget}${RESET}${ceiling}`
 }
 
+// v0.0.27 — lanes-A badge: [N open · M FYI]. action_open is the server's
+// watermark-independent count of unresolved obligations owed to this agent
+// (yellow — needs a reply); fyi_waiting is the plugin's held-FYI digest-queue
+// count (dim — informational, surfaces in the next digest). Omitted entirely
+// when both are 0 so a quiet inbox keeps a clean line.
+let laneBadge = ''
+const ln = payload.lanes
+if (ln) {
+  const open = typeof ln.action_open === 'number' ? ln.action_open : 0
+  const fyi = typeof ln.fyi_waiting === 'number' ? ln.fyi_waiting : 0
+  if (open > 0 || fyi > 0) {
+    const parts: string[] = []
+    if (open > 0) parts.push(`${YELLOW}${open} open${RESET}`)
+    if (fyi > 0) parts.push(`${DIM}${fyi} FYI${RESET}`)
+    laneBadge = ` ${DIM}[${RESET}${parts.join(`${DIM} · ${RESET}`)}${DIM}]${RESET}`
+  }
+}
+
 let journalBadge = ''
 if (typeof payload.journal_count === 'number' && payload.journal_count > 0) {
   // YELLOW when queue is non-empty during ONLINE (catching up), RED when
@@ -145,5 +167,5 @@ if (typeof payload.journal_count === 'number' && payload.journal_count > 0) {
   journalBadge = ` ${color}j:${payload.journal_count}${RESET}`
 }
 
-const out = `${glyph} junto-inbox ${DIM}${project}/${agent}${RESET} ${label}${budget}${journalBadge}`
+const out = `${glyph} junto-inbox ${DIM}${project}/${agent}${RESET} ${label}${budget}${laneBadge}${journalBadge}`
 process.stdout.write(out)

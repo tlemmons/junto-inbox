@@ -3,6 +3,52 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.27
+
+Lanes-A render (Stage 3 of `design:unified-messaging-v0`; wire shape
+`interface:lanes-a-server-wire-v0` v0.3.0, server half deployed `b32f1a8`).
+The server now tags every message with a `lane` (`action` | `cleared` | `fyi`)
++ `tier`, and returns a top-level `lane_counts`. This release adds the two
+plugin-side renders. All additive — an older server with no `lane` field
+delivers everything immediately and shows no badge, identical to v0.0.26.
+
+### Badge — `[N open · M FYI]`
+
+The status file gains a `lanes` block `{action_open, fyi_waiting}` that
+`statusline.ts` renders after the budget chip:
+
+- **N open** (yellow) = `lane_counts.pending_action_open` — unresolved
+  obligations owed to this agent. Sourced straight from the server; this count
+  is **watermark-independent**, so it stays correct even though the plugin
+  reads the inbox continuously.
+- **M FYI** (dim) = the plugin's **own** held-FYI digest-queue length — *not*
+  the server's `pending_fyi_waiting`. The server count zeroes the instant the
+  plugin's read advances the read-watermark (before the human ever sees the
+  FYI), so only the plugin can honestly count "FYIs held, not yet shown."
+
+Omitted entirely when both are 0, keeping a quiet inbox on a clean line.
+
+### FYI digest
+
+Messages with `lane === "fyi"` are diverted from immediate per-message delivery
+into an in-memory queue and surfaced as **one consolidated digest** channel
+notification (`meta.kind = "fyi_digest"`). Flush triggers:
+
+- **piggyback** — when an action message wakes the agent anyway, held FYIs ride
+  the same wake;
+- **timer** — a 15-minute backstop for quiet periods;
+- **cap** — a 10-message queue ceiling.
+
+Everything that is *not* a pure FYI — `action`, `cleared`, an unknown/missing
+lane, or anything flagged `requires_review` / `is_system_notice` — still
+delivers immediately. Fail-visible: the plugin never batches something that
+might need attention, and an unrecognized lane is treated as `action`. On a
+failed digest emit the items are requeued (never dropped). Held FYIs are not
+lost on shutdown — they remain in the server inbox, just unbatched.
+
+Kill switch: `JUNTO_FYI_DIGEST=0` (or `false`) reverts FYI batching to
+immediate delivery; the badge then shows only `[N open]`.
+
 ## v0.0.26
 
 Autopilot removal — plugin side (Phase 1 of `design:autopilot-removal-v0`).

@@ -7,6 +7,26 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.27 — lanes-A render (Stage 3 of design:unified-messaging-v0; wire shape
+ *          interface:lanes-a-server-wire-v0 v0.3.0, server half deployed b32f1a8).
+ *          Two plugin-side renders of the server's per-msg lane/tier + top-level
+ *          lane_counts. (1) BADGE: the status file gains a `lanes` block
+ *          {action_open, fyi_waiting}; statusline.ts renders [N open · M FYI].
+ *          action_open = server lane_counts.pending_action_open (watermark-
+ *          INDEPENDENT → correct despite the plugin's continuous reads);
+ *          fyi_waiting = the plugin's OWN held-FYI queue length, NOT the server's
+ *          pending_fyi_waiting (which zeroes on watermark-advance the moment the
+ *          plugin reads, before the human sees the FYI — only the plugin can
+ *          honestly count "held, not yet shown"). (2) FYI DIGEST: lane==="fyi"
+ *          messages divert from immediate per-msg delivery into fyiQueue and
+ *          surface as ONE consolidated channel notif on flush — piggyback on the
+ *          next action wake, a 15-min timer, or a 10-msg cap. action/cleared/
+ *          unknown-lane/requires_review/system_notice still deliver immediately
+ *          (fail-visible; never batch something that may need attention). Old
+ *          server (no lane field) → everything immediate + no badge = identical
+ *          to v0.0.26. Kill switch JUNTO_FYI_DIGEST=0 reverts FYI batching
+ *          (badge then shows only [N open]). Client version strings 0.0.26 →
+ *          0.0.27 (3 sites).
  * v0.0.26 — autopilot removal (plugin side; Phase 1 of design:autopilot-removal-v0).
  *          Statusline observability repoints from memory_autopilot_count to
  *          memory_get_emission_stats (push-control's live counters): the chip reads
@@ -370,12 +390,68 @@ let journalDirCreated = false
 
 type PluginStatus = 'connected' | 'reconnecting' | 'shutdown' | 'boot-failed'
 
+// v0.0.27 — lanes-A render (Stage 3 of design:unified-messaging-v0; wire shape
+// interface:lanes-a-server-wire-v0 v0.3.0). The server tags every message with
+// lane ("action"|"cleared"|"fyi") + tier and returns top-level lane_counts. Two
+// plugin-side renders:
+//   (1) BADGE — the status file gains a `lanes` block {action_open, fyi_waiting}
+//       that statusline.ts renders as [N open · M FYI]. action_open comes from
+//       the server's lane_counts.pending_action_open (watermark-INDEPENDENT, so
+//       correct even though the plugin reads the inbox continuously). fyi_waiting
+//       is the plugin's OWN digest-queue length, NOT the server's
+//       pending_fyi_waiting — the latter zeroes the instant the plugin's read
+//       advances the watermark (before the human ever sees the FYI), so only the
+//       plugin can honestly count "FYIs held, not yet shown to the human."
+//   (2) FYI DIGEST — lane==="fyi" messages are diverted from immediate per-msg
+//       delivery into fyiQueue and surfaced as ONE consolidated channel notif on
+//       a flush (piggyback on the next action wake / 15-min timer / count cap).
+//       Everything else (action, cleared, unknown/missing lane, requires_review,
+//       system_notice) still delivers immediately — fail-visible, never batch
+//       something that might need attention. Kill switch: JUNTO_FYI_DIGEST=0
+//       reverts to immediate FYI delivery (badge then shows only [N open]).
+type EmissionSnapshot = {
+  count?: number
+  push_budget?: number
+  hard_ceiling?: number
+  suspended?: boolean
+}
+type LaneCounts = {
+  pending_action_open?: number
+  pending_action_responded?: number
+  pending_fyi_waiting?: number
+}
+type FyiItem = {
+  id: string
+  from: string
+  from_project: string
+  body: string
+  ts: string
+  category: string
+  priority: string
+}
+
+const FYI_DIGEST_ENABLED = envVar('FYI_DIGEST') !== '0' && envVar('FYI_DIGEST') !== 'false'
+const FYI_DIGEST_INTERVAL_MS = 15 * 60_000
+const FYI_DIGEST_CAP = 10
+
+let lastEmission: EmissionSnapshot | null = null
+let lastLaneCounts: LaneCounts | null = null
+let fyiQueue: FyiItem[] = []
+
 function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}): void {
   try {
     if (!statusDirCreated) {
       mkdirSync(STATUS_DIR, { recursive: true })
       statusDirCreated = true
     }
+    // lanes block: include once we've ever seen server lane_counts OR are
+    // holding FYIs. action_open from the server (watermark-independent);
+    // fyi_waiting from our own held queue. Omitted entirely for an old server
+    // (no lane_counts) with an empty queue → clean statusline, no badge.
+    const lanes =
+      lastLaneCounts || fyiQueue.length > 0
+        ? { action_open: lastLaneCounts?.pending_action_open ?? 0, fyi_waiting: fyiQueue.length }
+        : null
     const payload = JSON.stringify({
       state,
       project: PROJECT,
@@ -385,6 +461,8 @@ function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}):
       last_update: new Date().toISOString(),
       health_state: healthState,
       journal_count: journal.length,
+      ...(lastEmission ? { emission: lastEmission } : {}),
+      ...(lanes ? { lanes } : {}),
       ...extras,
     })
     writeFileSync(STATUS_FILE, payload)
@@ -567,7 +645,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.26' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.27' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -714,7 +792,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.26' },
+  { name: 'junto-inbox', version: '0.0.27' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1046,7 +1124,71 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
+// v0.0.27 — flush held FYIs as one consolidated digest channel notification.
+// No-op when the queue is empty, the agent isn't ready, or the server is
+// offline (the timer / next piggyback retries). On emit failure the items are
+// requeued so an FYI is never lost to a transient notification error. Clearing
+// the queue drops the badge's fyi_waiting to 0 (written via writeStatus).
+async function flushFyiDigest(reason: string): Promise<void> {
+  if (fyiQueue.length === 0) return
+  if (!agentReady || healthState === 'offline') {
+    debugLog(`flushFyiDigest: held (${fyiQueue.length}) — ready=${agentReady} health=${healthState}`)
+    return
+  }
+  const items = fyiQueue
+  fyiQueue = []
+  const lines = items.map(it => {
+    const oneLine = it.body.replace(/\s+/g, ' ').trim()
+    const snippet = oneLine.length > 140 ? `${oneLine.slice(0, 140)}…` : oneLine
+    return `• ${it.from}@${it.from_project}: ${snippet}`
+  })
+  const content = `[FYI DIGEST · ${items.length} message${items.length === 1 ? '' : 's'}]\n${lines.join('\n')}`
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          kind: 'fyi_digest',
+          count: String(items.length),
+          msg_ids: items.map(it => it.id).join(','),
+          from_agent: 'junto-inbox',
+          from_project: PROJECT,
+          chain_depth: '0',
+          category: 'info',
+          priority: 'low',
+          ts: new Date().toISOString(),
+          requires_review: 'false',
+          is_system_notice: 'false',
+        },
+      },
+    })
+    debugLog(`flushFyiDigest: emitted digest of ${items.length} (reason=${reason})`)
+  } catch (err) {
+    // Emit failed — requeue (in original order, ahead of anything newly queued)
+    // so the next flush retries rather than dropping the FYIs.
+    fyiQueue = items.concat(fyiQueue)
+    debugLog(`flushFyiDigest: emit failed (${err instanceof Error ? err.message : String(err)}); requeued ${items.length}`)
+    return
+  }
+  writeStatus('connected')
+}
+
+let fyiDigestTimer: ReturnType<typeof setInterval> | null = null
+function startFyiDigestTimer(): void {
+  if (!FYI_DIGEST_ENABLED) return
+  if (fyiDigestTimer !== null) clearInterval(fyiDigestTimer)
+  fyiDigestTimer = setInterval(() => { void flushFyiDigest('timer') }, FYI_DIGEST_INTERVAL_MS)
+}
+function stopFyiDigestTimer(): void {
+  if (fyiDigestTimer !== null) {
+    clearInterval(fyiDigestTimer)
+    fyiDigestTimer = null
+  }
+}
+
 async function deliverNew(messages: Array<Record<string, unknown>>) {
+  let emittedImmediate = false
   for (const m of messages) {
     const id = String(m.id ?? m._id ?? '')
     if (!id || seenIds.has(id)) continue
@@ -1066,6 +1208,29 @@ async function deliverNew(messages: Array<Record<string, unknown>>) {
     seenIds.add(id)
 
     const body = String(m.message ?? m.body ?? '')
+
+    // v0.0.27 — lanes-A: divert pure FYIs to the digest queue. lane is the
+    // server-computed classification (interface:lanes-a-server-wire-v0). Only an
+    // EXPLICIT lane==="fyi" with no review/system flag is batched; missing or
+    // unrecognized lane falls through to immediate delivery (forward-compat:
+    // treat unknown as action, fail-visible). require_human / system notices
+    // always deliver immediately regardless of lane.
+    const lane = String(m.lane ?? '')
+    if (FYI_DIGEST_ENABLED && lane === 'fyi' && !requiresReview && !isSystemNotice) {
+      fyiQueue.push({
+        id,
+        from: String(m.from ?? m.from_instance ?? 'unknown'),
+        from_project: String(m.from_project ?? PROJECT),
+        body,
+        ts: String(m.created ?? new Date().toISOString()),
+        category: String(m.category ?? 'info'),
+        priority: String(m.priority ?? 'normal'),
+      })
+      debugLog(`deliverNew: queued FYI id=${id} (queue=${fyiQueue.length})`)
+      if (fyiQueue.length >= FYI_DIGEST_CAP) await flushFyiDigest('cap')
+      continue
+    }
+
     const markers: string[] = []
     if (requiresReview) markers.push('[REQUIRES REVIEW]')
     if (isSystemNotice) markers.push('[SYSTEM NOTICE]')
@@ -1088,8 +1253,15 @@ async function deliverNew(messages: Array<Record<string, unknown>>) {
         },
       },
     })
+    emittedImmediate = true
     debugLog(`deliverNew: emitted channel notif id=${id} depth=${chainDepth} review=${requiresReview} system_notice=${isSystemNotice}`)
   }
+
+  // Piggyback: if an action message just woke the agent, surface any held FYIs
+  // in the same wake rather than as a separate later interruption.
+  if (emittedImmediate && fyiQueue.length > 0) await flushFyiDigest('piggyback')
+  // Refresh the badge (action_open / fyi_waiting may have changed this batch).
+  writeStatus('connected')
 }
 
 const MAX_PAGES = 50
@@ -1099,6 +1271,7 @@ type InboxPage = {
   next_cursor?: string | null
   has_more?: boolean
   error?: string
+  lane_counts?: LaneCounts
 }
 
 async function readInboxAndForward() {
@@ -1147,9 +1320,16 @@ async function readInboxAndForward() {
       return
     }
 
+    // v0.0.27 — capture the server's lane_counts for the badge. pending_action_open
+    // is watermark-independent, so it stays correct even though this read advances
+    // the watermark. deliverNew's trailing writeStatus picks this up; also refresh
+    // here for the no-messages case (counts can change with nothing to deliver).
+    if (body.lane_counts) lastLaneCounts = body.lane_counts
+
     const messages = body.messages ?? []
-    debugLog(`readInbox p${pages}: ${messages.length} msgs (ids=${messages.map(m => m.id).join(',')}) has_more=${body.has_more === true} cursor=${body.next_cursor ?? 'null'}`)
+    debugLog(`readInbox p${pages}: ${messages.length} msgs (ids=${messages.map(m => m.id).join(',')}) has_more=${body.has_more === true} cursor=${body.next_cursor ?? 'null'} lane_counts=${body.lane_counts ? JSON.stringify(body.lane_counts) : 'none'}`)
     if (messages.length > 0) await deliverNew(messages)
+    else if (body.lane_counts) writeStatus('connected')
 
     cursor = body.next_cursor ?? null
     more = body.has_more === true && cursor !== null
@@ -1190,13 +1370,6 @@ async function heartbeatOnce(): Promise<void> {
   }
 }
 
-type EmissionSnapshot = {
-  count?: number
-  push_budget?: number
-  hard_ceiling?: number
-  suspended?: boolean
-}
-
 // Read-only poll of push-control's per-sender emission counters. No event
 // recorded. Safe to call on every heartbeat. Returns null on any failure so a
 // flaky observability call never breaks the heartbeat path.
@@ -1235,8 +1408,8 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
   heartbeatTimer = setInterval(() => {
     void heartbeatOnce()
       .then(async () => {
-        const emission = await fetchEmissionSnapshot()
-        writeStatus('connected', emission ? { emission } : {})
+        lastEmission = await fetchEmissionSnapshot()
+        writeStatus('connected')
       })
       .catch((err: unknown) => {
         const m = err instanceof Error ? err.message : String(err)
@@ -1251,7 +1424,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.26' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.27' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })
@@ -1328,6 +1501,7 @@ async function shutdown(reason: string) {
   process.stderr.write(`junto-inbox: shutdown (${reason})\n`)
   stopHeartbeat()
   stopHealthPoller()
+  stopFyiDigestTimer()
   writeStatus('shutdown', { reason })
   try {
     if (sm && sessionId) await callMemory('memory_end_session', { session_id: sessionId, summary: 'junto-inbox shutting down' })
@@ -1342,6 +1516,7 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'))
 migrateOutboxToJournal()
 loadJournal()
 startHealthPoller()
+startFyiDigestTimer()
 await mcp.connect(new StdioServerTransport())
 void supervisor()
 process.stderr.write(`junto-inbox: subscribe-mode for ${PROJECT}/${AGENT}\n`)

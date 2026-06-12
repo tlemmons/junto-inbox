@@ -59,6 +59,9 @@ fallback was removed in v0.0.15):
 - `JUNTO_SHARED_MEMORY_URL` (default `http://localhost:8080/mcp`) — point this at wherever your shared-memory MCP server is reachable.
 - `JUNTO_API_KEY` (only if shared-memory has `MCP_AUTH_ENABLED=true`)
 - `JUNTO_DEBUG=1` — write per-event traces to `./junto-inbox-debug.log`.
+- `JUNTO_FYI_DIGEST` (default on) — set to `0`/`false` to disable FYI
+  batching (v0.0.27). When off, `lane === "fyi"` messages deliver immediately
+  like every other message and the statusline badge shows only `[N open]`.
 
 ## Install
 
@@ -357,6 +360,16 @@ with `intent_id` reconciliation — is Phase 1
 The plugin writes `~/.claude/junto-inbox/<project>-<agent>.status` on every
 state transition. `statusline.ts` in this directory reads it and prints a
 single-line health indicator suitable for Claude Code's `statusLine` setting.
+
+The line reads `● junto-inbox <project>/<agent> <state> <budget> [N open · M FYI] <j:N>`:
+
+- **budget** (v0.0.26) — push-control emission chip `count/push_budget
+  (hard_ceiling)`, e.g. `2/30 (100)`.
+- **`[N open · M FYI]`** (v0.0.27, lanes-A) — `N` unresolved action obligations
+  owed to this agent (yellow, from the server's watermark-independent
+  `lane_counts.pending_action_open`); `M` FYIs held for the next digest (dim,
+  the plugin's own queue length). Hidden when both are 0.
+- **`j:N`** — journal entries awaiting drain.
 
 ## Known limitations
 

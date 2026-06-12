@@ -62,6 +62,7 @@ export const DENY_LIST = new Set<string>([
   'mcp__junto__memory_checklist',
   'mcp__junto__memory_db',
   // get_* family (read-only)
+  'mcp__junto__memory_get_emission_stats',
   'mcp__junto__memory_get_messages',
   'mcp__junto__memory_get_spec',
   'mcp__junto__memory_get_by_id',

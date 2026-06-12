@@ -7,6 +7,22 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.26 — autopilot removal (plugin side; Phase 1 of design:autopilot-removal-v0).
+ *          Statusline observability repoints from memory_autopilot_count to
+ *          memory_get_emission_stats (push-control's live counters): the chip reads
+ *          its own (agent, project) row {count, push_budget, hard_ceiling, suspended}
+ *          and renders count/push_budget (hard_ceiling), red when suspended /
+ *          over-ceiling / over-budget. Drops the opt-in AUTOPILOT_ENABLE bind block
+ *          + JUNTO_AUTOPILOT_{ENABLE,DEPTH_CAP,BUDGET} env vars. Server-side
+ *          autopilot_* tools are NOT deleted yet: sequencing is keep-then-delete
+ *          (removal spec §3), NOT the memory_autopilot_* → memory_push_* alias regime
+ *          the v0.0.25 note below assumed — no tool-alias infra exists and there is
+ *          no memory_push_* tool to alias to. Idle case: the server's synthetic
+ *          zero-row (removal spec §4(a), shipped c48f23c) returns live caps for a
+ *          zero-emission agent so the idle chip shows 0/N (ceiling); the plugin also
+ *          tolerates an empty stats[] (omits the budget segment) against an older
+ *          server. Client version strings bumped
+ *          0.0.25 → 0.0.26 (3 sites).
  * v0.0.25 — autopilot decouple. Push-control v0 (memory commit e82214d, spec
  *          design:push-control-v0 v1.1.0) moved the brake to the server send-side:
  *          per-sender depth_cap / push_budget / hard_ceiling are evaluated at
@@ -253,10 +269,11 @@
  *          Idempotent: re-applies on every reconnect. Server-side budget
  *          breach can still flip enabled=false; that flip persists until the
  *          next plugin reconnect re-applies the env-driven config.
- * v0.0.6 — env-gates the cterm-inbox-debug.log writes behind CT_DEBUG=1.
- *          Default install is silent; set CT_DEBUG=1 to capture per-event
- *          traces in ./cterm-inbox-debug.log. process.stderr is unchanged
- *          (CC captures it in ~/.claude/debug/<session>.txt).
+ * v0.0.6 — env-gates the debug-log writes behind CT_DEBUG=1. Default install
+ *          is silent. (Current code: the gate is JUNTO_DEBUG=1 and the file
+ *          is ./junto-inbox-debug.log — renamed in the v0.0.15 CT_*→JUNTO_*
+ *          migration.) process.stderr is unchanged (CC captures it in
+ *          ~/.claude/debug/<session>.txt).
  * v0.0.5 — paginates the inbox drain via memory_get_messages(cursor=...) so
  *          backlogs >20 messages don't get stuck. Capped at 50 pages per
  *          read to bound the worst case.
@@ -331,9 +348,6 @@ const PROJECT = envVar('PROJECT')
 const AGENT = envVar('AGENT')
 const API_KEY = envVar('API_KEY') ?? null
 const ROLE = envVar('ROLE') ?? null
-const AUTOPILOT_ENABLE = envVar('AUTOPILOT_ENABLE') === '1' || envVar('AUTOPILOT_ENABLE') === 'true'
-const AUTOPILOT_DEPTH_CAP = Number(envVar('AUTOPILOT_DEPTH_CAP') ?? 5)
-const AUTOPILOT_BUDGET = Number(envVar('AUTOPILOT_BUDGET') ?? 30)
 
 if (!PROJECT || !AGENT) {
   process.stderr.write('junto-inbox: JUNTO_PROJECT and JUNTO_AGENT must be set\n')
@@ -553,7 +567,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.25' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.26' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -700,7 +714,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.25' },
+  { name: 'junto-inbox', version: '0.0.26' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1176,37 +1190,42 @@ async function heartbeatOnce(): Promise<void> {
   }
 }
 
-type AutopilotSnapshot = {
-  current_count?: number
-  hourly_budget?: number
-  depth_cap?: number
-  enabled?: boolean
-  paused_at?: string | null
-  paused_reason?: string | null
+type EmissionSnapshot = {
+  count?: number
+  push_budget?: number
+  hard_ceiling?: number
+  suspended?: boolean
 }
 
-// Read-only poll — no autopilot_event recorded. Safe to call on every
-// heartbeat. Returns null on any failure so a flaky observability call never
-// breaks the heartbeat path.
-async function fetchAutopilotSnapshot(): Promise<AutopilotSnapshot | null> {
+// Read-only poll of push-control's per-sender emission counters. No event
+// recorded. Safe to call on every heartbeat. Returns null on any failure so a
+// flaky observability call never breaks the heartbeat path.
+//
+// get_emission_stats(agent, project) returns {count, stats:[row]} where the
+// explicit agent= filter narrows to this plugin's own current-hour row
+// server-side. An empty stats[] means zero emissions this hour: until the
+// server ships the synthetic zero-row (design:autopilot-removal-v0 §4(a)) that
+// case yields null → the chip omits the budget segment. Once the zero-row
+// lands, stats[0] carries count:0 + live caps + the resolved suspended flag and
+// the idle chip renders normally.
+async function fetchEmissionSnapshot(): Promise<EmissionSnapshot | null> {
   if (!sm || !sessionId) return null
   try {
-    const res = (await callMemory('memory_autopilot_count', {
+    const res = (await callMemory('memory_get_emission_stats', {
       session_id: sessionId,
-      project: PROJECT,
       agent: AGENT,
-    })) as AutopilotSnapshot | null
-    if (!res || typeof res !== 'object') return null
+      project: PROJECT,
+    })) as { stats?: Array<Record<string, unknown>> } | null
+    const row = res?.stats?.[0]
+    if (!row || typeof row !== 'object') return null
     return {
-      current_count: res.current_count,
-      hourly_budget: res.hourly_budget,
-      depth_cap: res.depth_cap,
-      enabled: res.enabled,
-      paused_at: res.paused_at ?? null,
-      paused_reason: res.paused_reason ?? null,
+      count: typeof row.count === 'number' ? row.count : undefined,
+      push_budget: typeof row.push_budget === 'number' ? row.push_budget : undefined,
+      hard_ceiling: typeof row.hard_ceiling === 'number' ? row.hard_ceiling : undefined,
+      suspended: typeof row.suspended === 'boolean' ? row.suspended : undefined,
     }
   } catch (err) {
-    debugLog(`fetchAutopilotSnapshot: ${err instanceof Error ? err.message : String(err)}`)
+    debugLog(`fetchEmissionSnapshot: ${err instanceof Error ? err.message : String(err)}`)
     return null
   }
 }
@@ -1216,8 +1235,8 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
   heartbeatTimer = setInterval(() => {
     void heartbeatOnce()
       .then(async () => {
-        const autopilot = await fetchAutopilotSnapshot()
-        writeStatus('connected', autopilot ? { autopilot } : {})
+        const emission = await fetchEmissionSnapshot()
+        writeStatus('connected', emission ? { emission } : {})
       })
       .catch((err: unknown) => {
         const m = err instanceof Error ? err.message : String(err)
@@ -1232,7 +1251,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.25' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.26' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
   })
@@ -1248,25 +1267,6 @@ async function bindAndSubscribe(): Promise<void> {
   })
   sessionId = (start as { session_id?: string } | null)?.session_id ?? null
   if (!sessionId) throw new Error('no session_id returned from memory_start_session')
-
-  if (AUTOPILOT_ENABLE) {
-    try {
-      await callMemory('memory_set_autopilot', {
-        session_id: sessionId,
-        project: PROJECT,
-        agent: AGENT,
-        enabled: true,
-        depth_cap: AUTOPILOT_DEPTH_CAP,
-        hourly_budget: AUTOPILOT_BUDGET,
-      })
-      process.stderr.write(`junto-inbox: autopilot enabled (depth_cap=${AUTOPILOT_DEPTH_CAP}, hourly_budget=${AUTOPILOT_BUDGET})\n`)
-      debugLog(`bindAndSubscribe: autopilot set enabled=true depth_cap=${AUTOPILOT_DEPTH_CAP} budget=${AUTOPILOT_BUDGET}`)
-    } catch (err) {
-      const m = err instanceof Error ? err.message : String(err)
-      process.stderr.write(`junto-inbox: memory_set_autopilot failed (continuing): ${m}\n`)
-      debugLog(`bindAndSubscribe: memory_set_autopilot failed: ${m}`)
-    }
-  }
 
   await client.subscribeResource({ uri: INBOX_URI })
   process.stderr.write(`junto-inbox: connected, session=${sessionId}, subscribed=${INBOX_URI}\n`)

@@ -3,6 +3,67 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.26
+
+Autopilot removal — plugin side (Phase 1 of `design:autopilot-removal-v0`).
+The autopilot "gate" is gone; push-control is the sole brake. This release
+repoints the statusline's observability and drops the opt-in autopilot bind
+config. No `deliverNew` behavior change.
+
+### Statusline observability repoint
+
+`fetchAutopilotSnapshot` → `fetchEmissionSnapshot`. The heartbeat poll now
+calls `memory_get_emission_stats(agent, project)` instead of
+`memory_autopilot_count`, reading the plugin's own current-hour row
+`{count, push_budget, hard_ceiling, suspended}` (the explicit `agent=` filter
+narrows to that row server-side — no client-side list filtering). The status
+file's `autopilot` extra is renamed `emission` to match. The chip renders
+`count/push_budget (hard_ceiling)` — e.g. `2/30 (100)` — colored:
+
+- **red** when `suspended`, when `count >= hard_ceiling`, or when at/over the
+  soft `push_budget`;
+- **yellow** at ≥80% of `push_budget`;
+- **green** otherwise.
+
+`suspended` replaces the old `enabled`/`paused_at` red state. `hard_ceiling`
+(the 100/hr hard stop) is new in the chip.
+
+### Idle case (zero emissions)
+
+A row only exists once an agent has emitted this hour. The server's synthetic
+zero-row (`design:autopilot-removal-v0` §4(a), option A — `{count:0, …caps,
+suspended resolved from the suspension store}`, shipped + live as `c48f23c`)
+returns live caps for a zero-emission agent, so the idle chip shows `0/30 (100)`
+and a suspended-but-idle agent still renders red. The plugin also tolerates an
+empty `stats:[]` — omitting the budget segment — for resilience against an
+older server. Caps are never hardcoded plugin-side.
+
+### Removed
+
+- The opt-in `AUTOPILOT_ENABLE` bind block (`memory_set_autopilot` at session
+  bind) and the `AUTOPILOT_ENABLE` / `AUTOPILOT_DEPTH_CAP` / `AUTOPILOT_BUDGET`
+  consts.
+- Env vars `JUNTO_AUTOPILOT_ENABLE`, `JUNTO_AUTOPILOT_DEPTH_CAP`,
+  `JUNTO_AUTOPILOT_BUDGET`.
+
+The `[AUTOPILOT GATED]` marker and `meta.autopilot_gated` were already removed
+in v0.0.25 — nothing left to scrub there.
+
+### Sequencing note
+
+The 6 server-side `memory_autopilot_*` tools are **not** deleted by this
+release. The window is **keep-then-delete**, not the "`memory_autopilot_*` →
+`memory_push_*` 30-day alias regime" the v0.0.25 notes below assumed — there is
+no tool-aliasing infrastructure and no `memory_push_*` tool to alias to. The
+tools stay live and harmless during the window (the only fielded caller was
+read-only `autopilot_count`, now gone); the server deletes them in Phase 2 once
+v0.0.26 is fielded everywhere (≥30 days). The `memory_autopilot_*` entries in
+`schema.ts` `DENY_LIST` are likewise left in place and removed in lockstep with
+Phase 2 (they still pass-through correctly while the tools are live);
+`memory_get_emission_stats` is added to the read deny-list now.
+
+Client name strings bumped from `'0.0.25'` to `'0.0.26'` (3 sites).
+
 ## v0.0.25
 
 Autopilot decouple. Push-control v0 (memory commit `e82214d`, spec

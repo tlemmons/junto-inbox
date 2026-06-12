@@ -63,13 +63,11 @@ type Status = {
   error?: string
   source?: string
   backoff_ms?: number
-  autopilot?: {
-    current_count?: number
-    hourly_budget?: number
-    depth_cap?: number
-    enabled?: boolean
-    paused_at?: string | null
-    paused_reason?: string | null
+  emission?: {
+    count?: number
+    push_budget?: number
+    hard_ceiling?: number
+    suspended?: boolean
   }
 }
 
@@ -121,16 +119,21 @@ if (payload.health_state === 'offline') {
 }
 
 let budget = ''
-const ap = payload.autopilot
-if (ap && typeof ap.current_count === 'number' && typeof ap.hourly_budget === 'number') {
-  const ratio = ap.hourly_budget > 0 ? ap.current_count / ap.hourly_budget : 0
-  // Pause state wins over ratio coloring; an explicitly disabled receiver is
-  // not "healthy at 0/N" — it's actively gated.
+const em = payload.emission
+if (em && typeof em.count === 'number' && typeof em.push_budget === 'number') {
+  const ratio = em.push_budget > 0 ? em.count / em.push_budget : 0
+  // Suspended wins over ratio coloring: a suspended sender is actively gated,
+  // not "healthy at 0/N". At idle the server's synthetic zero-row still resolves
+  // the live suspended flag (design:autopilot-removal-v0 §4(a)), so a suspended
+  // idle agent stays red instead of blanking to healthy. hard_ceiling (the
+  // 100/hr hard stop) shows in dim parens after the soft push_budget ratio.
   let color = GREEN
-  if (ap.enabled === false || ap.paused_at) color = RED
+  if (em.suspended) color = RED
+  else if (typeof em.hard_ceiling === 'number' && em.count >= em.hard_ceiling) color = RED
   else if (ratio >= 1) color = RED
   else if (ratio >= 0.8) color = YELLOW
-  budget = ` ${color}${ap.current_count}/${ap.hourly_budget}${RESET}`
+  const ceiling = typeof em.hard_ceiling === 'number' ? ` ${DIM}(${em.hard_ceiling})${RESET}` : ''
+  budget = ` ${color}${em.count}/${em.push_budget}${RESET}${ceiling}`
 }
 
 let journalBadge = ''

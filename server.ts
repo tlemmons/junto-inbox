@@ -7,6 +7,34 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.28 — server-authoritative announce handler, STEP 1 of
+ *          design:server-authoritative-delivery-v0 v0.5.3 (§E) — smoke-test prep,
+ *          NO strip yet. Registers a handler for the custom JSON-RPC notification
+ *          `notifications/junto/announce` that the server now CONTENT-PUSHES over
+ *          the SSE stream to each connected subscriber on every action-lane send
+ *          (info/fyi are NOT pushed — badge-only). Params are flat under `params`
+ *          (no wrapper): {mode, from_agent, from_project, category, priority,
+ *          msg_id, chain_depth, in_response_to, obligation_state, subject,
+ *          require_human, is_system_notice, created_at} + inline `body` iff
+ *          mode==="inject". On receipt the handler emits a notifications/claude/
+ *          channel — full body inline for inject, a one-line header for header —
+ *          then forgets. STATELESS: no seenIds, no cursor, no head-at-connect, no
+ *          digest, no dedup (a deliberate re-push is just another notification we
+ *          forward). The handler is ADDITIVE alongside the existing
+ *          resource_updated→readInboxAndForward path (§E7: server keeps sending
+ *          resource_updated too, so a server-new/plugin-old state degrades to
+ *          quiet, never a flood). CONSEQUENCE during this transitional step: an
+ *          ACTION message DOUBLE-EMITS — once via the announce handler, once via
+ *          the resource path (info does not double; it has no announce push). To
+ *          keep that attributable through the parallel run, announce-sourced
+ *          emits carry meta.source="announce" + a `[announce·<mode>]` content
+ *          prefix; both are removed in STEP 2 when the window-read path is
+ *          dropped. STEP 2 (gated on the inject-latency smoke test passing): strip
+ *          seenIds + plugin FYI digest + fyiQueue-as-M, drop the
+ *          window-read-on-resource_updated announce path, render server lane_counts
+ *          (M = pending_fyi_waiting) + the soft FYI-aging nudge. zod added as a
+ *          direct dep (was transitive via the SDK; same resolved 4.3.6). Client
+ *          version strings 0.0.27 → 0.0.28 (3 sites).
  * v0.0.27 — lanes-A render (Stage 3 of design:unified-messaging-v0; wire shape
  *          interface:lanes-a-server-wire-v0 v0.3.0, server half deployed b32f1a8).
  *          Two plugin-side renders of the server's per-msg lane/tier + top-level
@@ -323,7 +351,9 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
   ResourceUpdatedNotificationSchema,
+  NotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { z } from 'zod'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { homedir } from 'os'
@@ -429,6 +459,36 @@ type FyiItem = {
   category: string
   priority: string
 }
+
+// v0.0.28 — server-authoritative announce push (design:server-authoritative-
+// delivery-v0 v0.5.3 §E3). The server content-pushes this custom JSON-RPC
+// notification to each connected subscriber session on every action-lane send.
+// Params are FLAT under `params` (no params.data wrapper). The schema is
+// deliberately LENIENT — only the fields we need to render are required; the
+// rest are optional/nullish and the params object is loose — so a minor server
+// type surprise degrades render, never DROPS the wake (a strict-parse failure
+// would throw inside the SDK handler and lose the announce; durable-unread would
+// still catch the message at go, but the live wake would be silently lost).
+const AnnounceNotificationSchema = NotificationSchema.extend({
+  method: z.literal('notifications/junto/announce'),
+  params: z.looseObject({
+    mode: z.enum(['inject', 'header']),
+    from_agent: z.string(),
+    from_project: z.string().nullish(),
+    category: z.string().nullish(),
+    priority: z.string().nullish(),
+    msg_id: z.string(),
+    chain_depth: z.number().nullish(),
+    in_response_to: z.string().nullish(),
+    obligation_state: z.string().nullish(),
+    subject: z.string().nullish(),
+    require_human: z.boolean().nullish(),
+    is_system_notice: z.boolean().nullish(),
+    created_at: z.string().nullish(),
+    body: z.string().nullish(),
+  }),
+})
+type AnnouncePacket = z.infer<typeof AnnounceNotificationSchema>['params']
 
 const FYI_DIGEST_ENABLED = envVar('FYI_DIGEST') !== '0' && envVar('FYI_DIGEST') !== 'false'
 const FYI_DIGEST_INTERVAL_MS = 15 * 60_000
@@ -645,7 +705,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.27' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.28' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -792,7 +852,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.27' },
+  { name: 'junto-inbox', version: '0.0.28' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1264,6 +1324,71 @@ async function deliverNew(messages: Array<Record<string, unknown>>) {
   writeStatus('connected')
 }
 
+// v0.0.28 — STEP 1 announce handler. Receives a server-pushed
+// `notifications/junto/announce` and emits a single notifications/claude/channel
+// toward the host CC, then forgets. STATELESS: no seenIds, no dedup, no cursor —
+// the server only pushes action-lane sends and a deliberate re-push (escalation/
+// release) is just another notification we forward. We gate on agentReady (same
+// as readInboxAndForward) so we never push to a host that hasn't loaded its
+// state/guidelines yet; an announce missed while not-ready is recovered from the
+// durable unread set at the host's next `go`. The `[announce·<mode>]` prefix and
+// meta.source="announce" are TRANSITIONAL — they make this path distinguishable
+// from the parallel resource_updated emit during STEP 1's double-emit window and
+// are removed in STEP 2.
+async function forwardAnnounce(p: AnnouncePacket): Promise<void> {
+  if (!agentReady) {
+    debugLog(`forwardAnnounce: dropped (agent not ready) msg_id=${p.msg_id} mode=${p.mode}`)
+    return
+  }
+  const requiresReview = p.require_human === true
+  const isSystemNotice = p.is_system_notice === true
+  const markers: string[] = [`[announce·${p.mode}]`]
+  if (requiresReview) markers.push('[REQUIRES REVIEW]')
+  if (isSystemNotice) markers.push('[SYSTEM NOTICE]')
+
+  let content: string
+  if (p.mode === 'inject' && typeof p.body === 'string' && p.body.length > 0) {
+    // inject: full body inline (latency-to-attention tier).
+    content = `${markers.join(' ')} ${p.body}`
+  } else {
+    // header: no body on the wire — render a one-line header from the fields.
+    const subj = p.subject ? `: ${p.subject}` : ''
+    const from = `${p.from_agent}@${p.from_project ?? PROJECT}`
+    const tags = `[${p.category ?? 'info'}/${p.priority ?? 'normal'}]`
+    content = `${markers.join(' ')} ${from} ${tags}${subj} (msg ${p.msg_id})`
+  }
+
+  // meta values must all be strings, snake_case keys (CC channel meta is
+  // Record<string,string>). Null/absent optionals are omitted, not stringified.
+  const meta: Record<string, string> = {
+    source: 'announce',
+    mode: p.mode,
+    msg_id: p.msg_id,
+    from_agent: p.from_agent,
+    from_project: String(p.from_project ?? PROJECT),
+    chain_depth: String(p.chain_depth ?? 0),
+    category: String(p.category ?? 'info'),
+    priority: String(p.priority ?? 'normal'),
+    ts: String(p.created_at ?? new Date().toISOString()),
+    requires_review: String(requiresReview),
+    is_system_notice: String(isSystemNotice),
+  }
+  if (p.in_response_to) meta.in_response_to = String(p.in_response_to)
+  if (p.obligation_state) meta.obligation_state = String(p.obligation_state)
+
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+    debugLog(`forwardAnnounce: emitted mode=${p.mode} msg_id=${p.msg_id} from=${meta.from_agent}@${meta.from_project} review=${requiresReview} system_notice=${isSystemNotice}`)
+  } catch (err) {
+    // Best-effort, like every other channel emit. A dropped push is recovered
+    // by the durable-unread go/park reconcile; we do not requeue (stateless).
+    debugLog(`forwardAnnounce: emit failed msg_id=${p.msg_id}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 const MAX_PAGES = 50
 
 type InboxPage = {
@@ -1424,9 +1549,16 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.27' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.28' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     if (notif.params.uri === INBOX_URI) await readInboxAndForward()
+  })
+  // v0.0.28 — STEP 1: server-authoritative announce push. Additive alongside the
+  // resource_updated path above (§E7). Custom-method notifications are dispatched
+  // by method literal exactly like resource_updated; an unregistered method would
+  // silently no-op, so registering this is the whole opt-in.
+  client.setNotificationHandler(AnnounceNotificationSchema, async notif => {
+    await forwardAnnounce(notif.params)
   })
   await client.connect(transport)
   sm = client

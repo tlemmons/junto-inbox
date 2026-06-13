@@ -3,6 +3,43 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.28
+
+Server-authoritative announce handler — **step 1** of
+`design:server-authoritative-delivery-v0` v0.5.3 (§E). Smoke-test prep; no
+removals yet.
+
+The server now **content-pushes** a custom JSON-RPC notification,
+`notifications/junto/announce`, over the SSE stream to each connected
+subscriber on every action-lane send (info/fyi are not pushed — badge-only).
+This release registers a handler for it. The params are flat under `params`
+(no wrapper): `{mode, from_agent, from_project, category, priority, msg_id,
+chain_depth, in_response_to, obligation_state, subject, require_human,
+is_system_notice, created_at}` + inline `body` iff `mode === "inject"`. On
+receipt the handler emits a single `notifications/claude/channel` — full body
+inline for `inject`, a one-line header for `header` — then forgets. It is
+**stateless**: no `seenIds`, no cursor, no dedup (a deliberate re-push is just
+another notification we forward).
+
+The handler is **additive** alongside the existing
+`resource_updated` → `readInboxAndForward` path (§E7), so a server-new /
+plugin-old state degrades to quiet, never a flood. During this transitional
+step an **action message double-emits** — once via the announce handler, once
+via the resource path (info does not double). To keep that attributable through
+the parallel run, announce-sourced emits carry `meta.source="announce"` and a
+`[announce·<mode>]` content prefix; both are removed in step 2.
+
+The notification schema reuses the SDK's own zod (4.3.6) via
+`NotificationSchema.extend`, with lenient params (only `mode` / `from_agent` /
+`msg_id` required, the rest nullish, loose object) so a minor server type
+surprise degrades the render rather than throwing inside the SDK handler and
+dropping the live wake. `zod` is promoted to a direct dependency.
+
+**Step 2** (gated on the inject-latency smoke test passing): strip `seenIds` +
+the plugin FYI digest + `fyiQueue`-as-M, drop the
+window-read-on-`resource_updated` announce path, and render the server's
+`lane_counts` (M = `pending_fyi_waiting`) plus the soft FYI-aging nudge.
+
 ## v0.0.27
 
 Lanes-A render (Stage 3 of `design:unified-messaging-v0`; wire shape

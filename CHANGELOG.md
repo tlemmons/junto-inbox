@@ -3,6 +3,51 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.29
+
+Server-authoritative delivery — **step 2** (the strip) of
+`design:server-authoritative-delivery-v0` v0.5.3 (§E / §SEQUENCING).
+
+The inject-latency smoke-test gate passed (a `notifications/junto/announce`
+push surfaced at the host's next turn boundary mid-long-turn, full body inline),
+so the announce push is now the **sole live-delivery path** and the old
+window-read delivery is removed. This closes the v0.0.28 transitional
+double-emit window.
+
+Changes:
+
+- **Deleted `deliverNew` + `seenIds`.** The `resource_updated` path no longer
+  forwards messages, so there is nothing to dedup. Action-lane messages arrive
+  live via the announce handler; info/fyi are badge-only and reconciled by the
+  host's `go`-pull of the durable unread set.
+- **Deleted the plugin FYI digest entirely** — `fyiQueue`, `flushFyiDigest`,
+  the 15-min timer, the 10-cap, the `JUNTO_FYI_DIGEST` kill switch, the
+  `FyiItem` type. FYI is **badge-only** (no plugin digest, no server digest).
+- **`readInboxAndForward` → `refreshLaneCounts`.** A single read-inert resource
+  read that captures the server's `lane_counts` for the badge and writes the
+  status file — no message emit, no pagination (counts are server-computed over
+  the full inbox). Wired to the same callers (`resource_updated`, bind,
+  `markReady`, health-recovery).
+- **Badge `M` = server `lane_counts.pending_fyi_waiting`.** Under per-message
+  unread (`read_by`) the count is read-inert through the resource read, so the
+  plugin's glancing refresh never zeroes it — retiring the v0.0.27
+  `fyiQueue`-as-`M` workaround.
+- **Soft FYI-aging nudge.** `lane_counts` now also carries
+  `pending_fyi_oldest_age_hours` + `fyi_ttl_hours` (=48); the statusline turns
+  the FYI badge yellow and appends `·aging` once the oldest waiting FYI reaches
+  75% of the TTL, so info isn't lost unseen.
+- **`forwardAnnounce`** drops the transitional `[announce·<mode>]` content
+  prefix and `meta.source="announce"` (no parallel path left to attribute).
+
+The plugin now holds **zero message state**: connection management, the
+announce handler → CC channel emit, and statusline rendering of server counts.
+A missed/dropped announce is recovered by durable-unread at the next `go`-pull
+(the unread write is independent of push), so removing the window-read fallback
+is safe — worst case is a delayed wake, never a lost message.
+
+Net −134 LOC. `bun build` clean; `tsc` 0 new errors vs the v0.0.28 baseline.
+Like step 1, the flip takes effect on the next CC restart.
+
 ## v0.0.28
 
 Server-authoritative announce handler — **step 1** of

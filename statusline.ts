@@ -72,6 +72,11 @@ type Status = {
   lanes?: {
     action_open?: number
     fyi_waiting?: number
+    // v0.0.29 — soft FYI-aging guidance (passed through from the server's
+    // lane_counts). When the oldest waiting FYI nears the TTL, the badge hints
+    // "drain soon" so info isn't lost to the 48h TTL unseen.
+    fyi_oldest_age_hours?: number
+    fyi_ttl_hours?: number
   }
 }
 
@@ -140,11 +145,13 @@ if (em && typeof em.count === 'number' && typeof em.push_budget === 'number') {
   budget = ` ${color}${em.count}/${em.push_budget}${RESET}${ceiling}`
 }
 
-// v0.0.27 — lanes-A badge: [N open · M FYI]. action_open is the server's
-// watermark-independent count of unresolved obligations owed to this agent
-// (yellow — needs a reply); fyi_waiting is the plugin's held-FYI digest-queue
-// count (dim — informational, surfaces in the next digest). Omitted entirely
-// when both are 0 so a quiet inbox keeps a clean line.
+// v0.0.29 — lanes-A badge: [N open · M FYI]. Both counts are now server-sourced
+// (lane_counts, read-inert under per-message-unread). action_open is the count of
+// unresolved obligations owed to this agent (yellow — needs a reply); fyi_waiting
+// is the count of unseen FYIs (dim — informational, drained on go/reconcile).
+// When the oldest FYI nears the server's TTL (>=75%), the FYI part turns yellow
+// and gains a "·aging" hint so info isn't lost unseen. Omitted entirely when both
+// are 0 so a quiet inbox keeps a clean line.
 let laneBadge = ''
 const ln = payload.lanes
 if (ln) {
@@ -153,7 +160,14 @@ if (ln) {
   if (open > 0 || fyi > 0) {
     const parts: string[] = []
     if (open > 0) parts.push(`${YELLOW}${open} open${RESET}`)
-    if (fyi > 0) parts.push(`${DIM}${fyi} FYI${RESET}`)
+    if (fyi > 0) {
+      const age = ln.fyi_oldest_age_hours
+      const ttl = ln.fyi_ttl_hours
+      const aging =
+        typeof age === 'number' && typeof ttl === 'number' && ttl > 0 && age >= ttl * 0.75
+      if (aging) parts.push(`${YELLOW}${fyi} FYI·aging${RESET}`)
+      else parts.push(`${DIM}${fyi} FYI${RESET}`)
+    }
     laneBadge = ` ${DIM}[${RESET}${parts.join(`${DIM} · ${RESET}`)}${DIM}]${RESET}`
   }
 }

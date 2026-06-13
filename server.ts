@@ -7,6 +7,29 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.29 — server-authoritative delivery, STEP 2 (the strip) of
+ *          design:server-authoritative-delivery-v0 v0.5.3 (§E/§SEQUENCING). The
+ *          inject-latency smoke-test gate PASSED (announce surfaced at the host's
+ *          next turn boundary mid-long-turn, full body inline), so the announce
+ *          push is now the SOLE live-delivery path and the old window-read delivery
+ *          is removed. Changes: (1) DELETE deliverNew + seenIds — the resource path
+ *          no longer forwards messages, so there is nothing to dedup; the announce
+ *          handler delivers action-lane messages live, and info/fyi are badge-only,
+ *          surfaced on the host's go/reconcile pull. (2) DELETE the plugin FYI
+ *          digest entirely — fyiQueue, flushFyiDigest, the 15-min timer, the 10-cap,
+ *          the JUNTO_FYI_DIGEST kill switch, the FyiItem type (Tom: FYI = BADGE-ONLY,
+ *          no server digest either). (3) readInboxAndForward → refreshLaneCounts: a
+ *          single read-INERT resource read that captures the server's lane_counts for
+ *          the badge and writes the status file — NO message emit. Wired to the same
+ *          callers (resource_updated, bind, markReady, health-recovery). (4) BADGE
+ *          M = server lane_counts.pending_fyi_waiting (per-message-unread + read-inert
+ *          server-side → no longer zeroes on the plugin's glancing read, which is why
+ *          the v0.0.27 fyiQueue-as-M workaround can retire). (5) soft FYI-AGING nudge:
+ *          lane_counts now also carries pending_fyi_oldest_age_hours + fyi_ttl_hours
+ *          (=48); statusline shows a dim "aging" hint as the oldest FYI nears the TTL.
+ *          (6) forwardAnnounce drops the transitional [announce·<mode>] prefix +
+ *          meta.source="announce" (no parallel path left to attribute against).
+ *          Client version strings 0.0.28 → 0.0.29 (3 sites).
  * v0.0.28 — server-authoritative announce handler, STEP 1 of
  *          design:server-authoritative-delivery-v0 v0.5.3 (§E) — smoke-test prep,
  *          NO strip yet. Registers a handler for the custom JSON-RPC notification
@@ -420,25 +443,19 @@ let journalDirCreated = false
 
 type PluginStatus = 'connected' | 'reconnecting' | 'shutdown' | 'boot-failed'
 
-// v0.0.27 — lanes-A render (Stage 3 of design:unified-messaging-v0; wire shape
-// interface:lanes-a-server-wire-v0 v0.3.0). The server tags every message with
-// lane ("action"|"cleared"|"fyi") + tier and returns top-level lane_counts. Two
-// plugin-side renders:
-//   (1) BADGE — the status file gains a `lanes` block {action_open, fyi_waiting}
-//       that statusline.ts renders as [N open · M FYI]. action_open comes from
-//       the server's lane_counts.pending_action_open (watermark-INDEPENDENT, so
-//       correct even though the plugin reads the inbox continuously). fyi_waiting
-//       is the plugin's OWN digest-queue length, NOT the server's
-//       pending_fyi_waiting — the latter zeroes the instant the plugin's read
-//       advances the watermark (before the human ever sees the FYI), so only the
-//       plugin can honestly count "FYIs held, not yet shown to the human."
-//   (2) FYI DIGEST — lane==="fyi" messages are diverted from immediate per-msg
-//       delivery into fyiQueue and surfaced as ONE consolidated channel notif on
-//       a flush (piggyback on the next action wake / 15-min timer / count cap).
-//       Everything else (action, cleared, unknown/missing lane, requires_review,
-//       system_notice) still delivers immediately — fail-visible, never batch
-//       something that might need attention. Kill switch: JUNTO_FYI_DIGEST=0
-//       reverts to immediate FYI delivery (badge then shows only [N open]).
+// v0.0.29 — lanes-A badge render (server-authoritative). The server tags every
+// message with lane ("action"|"cleared"|"fyi") + tier and returns top-level
+// lane_counts; the plugin renders the BADGE only — the status file's `lanes` block
+// {action_open, fyi_waiting} is shown by statusline.ts as [N open · M FYI]. BOTH
+// counts now come straight from the server's lane_counts: action_open =
+// pending_action_open, fyi_waiting = pending_fyi_waiting. Under per-message-unread
+// (read_by) these are read-INERT through the resource read — the plugin's glancing
+// counts-refresh never marks anything read, so pending_fyi_waiting no longer zeroes
+// before the human sees the FYI, which retires the v0.0.27 fyiQueue-as-M workaround.
+// FYI = BADGE-ONLY (Tom): there is no plugin FYI digest and no server digest — info
+// surfaces on the host's go/reconcile pull. The soft FYI-aging nudge
+// (pending_fyi_oldest_age_hours vs fyi_ttl_hours) is passed through for statusline
+// to hint "FYIs aging, drain soon" as the oldest nears the 48h TTL.
 type EmissionSnapshot = {
   count?: number
   push_budget?: number
@@ -449,15 +466,11 @@ type LaneCounts = {
   pending_action_open?: number
   pending_action_responded?: number
   pending_fyi_waiting?: number
-}
-type FyiItem = {
-  id: string
-  from: string
-  from_project: string
-  body: string
-  ts: string
-  category: string
-  priority: string
+  // v0.0.29 — soft FYI-aging guidance (not a force; nothing auto-expires here).
+  // The server reports the oldest waiting FYI's age and the info TTL so the
+  // statusline can nudge "drain soon" before info ages out at the TTL.
+  pending_fyi_oldest_age_hours?: number
+  fyi_ttl_hours?: number
 }
 
 // v0.0.28 — server-authoritative announce push (design:server-authoritative-
@@ -490,13 +503,8 @@ const AnnounceNotificationSchema = NotificationSchema.extend({
 })
 type AnnouncePacket = z.infer<typeof AnnounceNotificationSchema>['params']
 
-const FYI_DIGEST_ENABLED = envVar('FYI_DIGEST') !== '0' && envVar('FYI_DIGEST') !== 'false'
-const FYI_DIGEST_INTERVAL_MS = 15 * 60_000
-const FYI_DIGEST_CAP = 10
-
 let lastEmission: EmissionSnapshot | null = null
 let lastLaneCounts: LaneCounts | null = null
-let fyiQueue: FyiItem[] = []
 
 function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}): void {
   try {
@@ -504,14 +512,22 @@ function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}):
       mkdirSync(STATUS_DIR, { recursive: true })
       statusDirCreated = true
     }
-    // lanes block: include once we've ever seen server lane_counts OR are
-    // holding FYIs. action_open from the server (watermark-independent);
-    // fyi_waiting from our own held queue. Omitted entirely for an old server
-    // (no lane_counts) with an empty queue → clean statusline, no badge.
-    const lanes =
-      lastLaneCounts || fyiQueue.length > 0
-        ? { action_open: lastLaneCounts?.pending_action_open ?? 0, fyi_waiting: fyiQueue.length }
-        : null
+    // lanes block: included once we've ever seen server lane_counts. Both counts
+    // are server-sourced (read-inert under per-message-unread). The aging fields
+    // pass straight through for statusline's soft "FYIs aging" nudge. Omitted
+    // entirely for an old server (no lane_counts) → clean statusline, no badge.
+    const lanes = lastLaneCounts
+      ? {
+          action_open: lastLaneCounts.pending_action_open ?? 0,
+          fyi_waiting: lastLaneCounts.pending_fyi_waiting ?? 0,
+          ...(typeof lastLaneCounts.pending_fyi_oldest_age_hours === 'number'
+            ? { fyi_oldest_age_hours: lastLaneCounts.pending_fyi_oldest_age_hours }
+            : {}),
+          ...(typeof lastLaneCounts.fyi_ttl_hours === 'number'
+            ? { fyi_ttl_hours: lastLaneCounts.fyi_ttl_hours }
+            : {}),
+        }
+      : null
     const payload = JSON.stringify({
       state,
       project: PROJECT,
@@ -692,10 +708,9 @@ async function drainJournal(): Promise<void> {
 
 // Sessionless health probe — runs continuously regardless of bound-session
 // state. After OFFLINE_FAIL_THRESHOLD consecutive failures (~45s at 12s
-// interval), the plugin enters OFFLINE state: statusline indicator goes red,
-// readInboxAndForward becomes a no-op (so the host CC doesn't autopilot-reply
-// against a dead server, which would queue locally and never deliver in
-// time to matter). On next successful probe, returns to ONLINE and resumes.
+// interval), the plugin enters OFFLINE state: statusline indicator goes red and
+// refreshLaneCounts becomes a no-op (no point reading the inbox resource against
+// a dead server). On next successful probe, returns to ONLINE and resumes.
 let healthState: 'online' | 'offline' = 'online'
 let healthFailCount = 0
 let healthTimer: ReturnType<typeof setInterval> | null = null
@@ -705,7 +720,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.28' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.29' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -758,7 +773,7 @@ function noteHealth(newHealth: 'online' | 'offline'): void {
   if (newHealth === 'online' && sm && sessionId) {
     loadJournal()
     void drainJournal()
-    void readInboxAndForward()
+    void refreshLaneCounts()
   }
 }
 
@@ -794,7 +809,6 @@ let agentReady = false
 // connected, currently disconnected" (reconnecting) in the supervisor catch.
 // First successful bindAndSubscribe sets this true; never reset.
 let everConnected = false
-const seenIds = new Set<string>()
 
 // Set by the supervisor to its current Promise reject so tool handlers can
 // abort the current bind iteration when they detect a dead session
@@ -814,10 +828,12 @@ function forceReconnect(reason: string): void {
 function markReady(via: string): void {
   if (agentReady) return
   agentReady = true
-  process.stderr.write(`junto-inbox: agent ready (${via}), draining inbox\n`)
-  debugLog(`markReady: signal=${via}, draining inbox`)
-  // Fire-and-forget: don't block the tool-call response on the drain.
-  void readInboxAndForward()
+  process.stderr.write(`junto-inbox: agent ready (${via})\n`)
+  debugLog(`markReady: signal=${via}`)
+  // Refresh the badge once the host is ready. No message drain: action-lane
+  // messages arrive live via the announce push; anything that landed while the
+  // host was away is durable-unread and reconciled by the host's go-pull.
+  void refreshLaneCounts()
 }
 
 async function callMemory(name: string, args: Record<string, unknown>) {
@@ -852,7 +868,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.28' },
+  { name: 'junto-inbox', version: '0.0.29' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1184,157 +1200,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-// v0.0.27 — flush held FYIs as one consolidated digest channel notification.
-// No-op when the queue is empty, the agent isn't ready, or the server is
-// offline (the timer / next piggyback retries). On emit failure the items are
-// requeued so an FYI is never lost to a transient notification error. Clearing
-// the queue drops the badge's fyi_waiting to 0 (written via writeStatus).
-async function flushFyiDigest(reason: string): Promise<void> {
-  if (fyiQueue.length === 0) return
-  if (!agentReady || healthState === 'offline') {
-    debugLog(`flushFyiDigest: held (${fyiQueue.length}) — ready=${agentReady} health=${healthState}`)
-    return
-  }
-  const items = fyiQueue
-  fyiQueue = []
-  const lines = items.map(it => {
-    const oneLine = it.body.replace(/\s+/g, ' ').trim()
-    const snippet = oneLine.length > 140 ? `${oneLine.slice(0, 140)}…` : oneLine
-    return `• ${it.from}@${it.from_project}: ${snippet}`
-  })
-  const content = `[FYI DIGEST · ${items.length} message${items.length === 1 ? '' : 's'}]\n${lines.join('\n')}`
-  try {
-    await mcp.notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content,
-        meta: {
-          kind: 'fyi_digest',
-          count: String(items.length),
-          msg_ids: items.map(it => it.id).join(','),
-          from_agent: 'junto-inbox',
-          from_project: PROJECT,
-          chain_depth: '0',
-          category: 'info',
-          priority: 'low',
-          ts: new Date().toISOString(),
-          requires_review: 'false',
-          is_system_notice: 'false',
-        },
-      },
-    })
-    debugLog(`flushFyiDigest: emitted digest of ${items.length} (reason=${reason})`)
-  } catch (err) {
-    // Emit failed — requeue (in original order, ahead of anything newly queued)
-    // so the next flush retries rather than dropping the FYIs.
-    fyiQueue = items.concat(fyiQueue)
-    debugLog(`flushFyiDigest: emit failed (${err instanceof Error ? err.message : String(err)}); requeued ${items.length}`)
-    return
-  }
-  writeStatus('connected')
-}
+// v0.0.29 — STEP 2 removed deliverNew + the plugin FYI digest entirely. The
+// announce push (forwardAnnounce) is the sole live-delivery path for action-lane
+// messages; info/fyi are badge-only and reconciled by the host's go-pull. The
+// resource read survives only as refreshLaneCounts (badge counts, no emit).
 
-let fyiDigestTimer: ReturnType<typeof setInterval> | null = null
-function startFyiDigestTimer(): void {
-  if (!FYI_DIGEST_ENABLED) return
-  if (fyiDigestTimer !== null) clearInterval(fyiDigestTimer)
-  fyiDigestTimer = setInterval(() => { void flushFyiDigest('timer') }, FYI_DIGEST_INTERVAL_MS)
-}
-function stopFyiDigestTimer(): void {
-  if (fyiDigestTimer !== null) {
-    clearInterval(fyiDigestTimer)
-    fyiDigestTimer = null
-  }
-}
-
-async function deliverNew(messages: Array<Record<string, unknown>>) {
-  let emittedImmediate = false
-  for (const m of messages) {
-    const id = String(m.id ?? m._id ?? '')
-    if (!id || seenIds.has(id)) continue
-
-    const chainDepth = Number(m.chain_depth ?? 0)
-    const requiresReview = m.require_human === true
-    const isSystemNotice = m.is_system_notice === true
-
-    // v0.0.25 — autopilot gate removed. Push-control v0 (memory commit e82214d)
-    // moved the brake server-side: senders are gated by depth_cap / push_budget /
-    // hard_ceiling at send time, and the server-side delivery-time filter excludes
-    // push-suppressed messages from the inbox-resource response unless the
-    // recipient's recency window is open (opened by memory_start_session for that
-    // agent, inbound sent_by_human=true, or outbound human_interacted=true).
-    // The plugin no longer makes a per-message check; whatever the server hands
-    // back, we render. Server's per-sender accounting is the authoritative gate.
-    seenIds.add(id)
-
-    const body = String(m.message ?? m.body ?? '')
-
-    // v0.0.27 — lanes-A: divert pure FYIs to the digest queue. lane is the
-    // server-computed classification (interface:lanes-a-server-wire-v0). Only an
-    // EXPLICIT lane==="fyi" with no review/system flag is batched; missing or
-    // unrecognized lane falls through to immediate delivery (forward-compat:
-    // treat unknown as action, fail-visible). require_human / system notices
-    // always deliver immediately regardless of lane.
-    const lane = String(m.lane ?? '')
-    if (FYI_DIGEST_ENABLED && lane === 'fyi' && !requiresReview && !isSystemNotice) {
-      fyiQueue.push({
-        id,
-        from: String(m.from ?? m.from_instance ?? 'unknown'),
-        from_project: String(m.from_project ?? PROJECT),
-        body,
-        ts: String(m.created ?? new Date().toISOString()),
-        category: String(m.category ?? 'info'),
-        priority: String(m.priority ?? 'normal'),
-      })
-      debugLog(`deliverNew: queued FYI id=${id} (queue=${fyiQueue.length})`)
-      if (fyiQueue.length >= FYI_DIGEST_CAP) await flushFyiDigest('cap')
-      continue
-    }
-
-    const markers: string[] = []
-    if (requiresReview) markers.push('[REQUIRES REVIEW]')
-    if (isSystemNotice) markers.push('[SYSTEM NOTICE]')
-    const content = markers.length ? `${markers.join(' ')} ${body}` : body
-
-    await mcp.notification({
-      method: 'notifications/claude/channel',
-      params: {
-        content,
-        meta: {
-          msg_id: id,
-          from_agent: String(m.from ?? m.from_instance ?? 'unknown'),
-          from_project: String(m.from_project ?? PROJECT),
-          chain_depth: String(chainDepth),
-          category: String(m.category ?? 'info'),
-          priority: String(m.priority ?? 'normal'),
-          ts: String(m.created ?? new Date().toISOString()),
-          requires_review: String(requiresReview),
-          is_system_notice: String(isSystemNotice),
-        },
-      },
-    })
-    emittedImmediate = true
-    debugLog(`deliverNew: emitted channel notif id=${id} depth=${chainDepth} review=${requiresReview} system_notice=${isSystemNotice}`)
-  }
-
-  // Piggyback: if an action message just woke the agent, surface any held FYIs
-  // in the same wake rather than as a separate later interruption.
-  if (emittedImmediate && fyiQueue.length > 0) await flushFyiDigest('piggyback')
-  // Refresh the badge (action_open / fyi_waiting may have changed this batch).
-  writeStatus('connected')
-}
-
-// v0.0.28 — STEP 1 announce handler. Receives a server-pushed
-// `notifications/junto/announce` and emits a single notifications/claude/channel
-// toward the host CC, then forgets. STATELESS: no seenIds, no dedup, no cursor —
-// the server only pushes action-lane sends and a deliberate re-push (escalation/
-// release) is just another notification we forward. We gate on agentReady (same
-// as readInboxAndForward) so we never push to a host that hasn't loaded its
-// state/guidelines yet; an announce missed while not-ready is recovered from the
-// durable unread set at the host's next `go`. The `[announce·<mode>]` prefix and
-// meta.source="announce" are TRANSITIONAL — they make this path distinguishable
-// from the parallel resource_updated emit during STEP 1's double-emit window and
-// are removed in STEP 2.
+// Announce handler (the sole live-delivery path as of v0.0.29 STEP 2). Receives a
+// server-pushed `notifications/junto/announce` and emits a single
+// notifications/claude/channel toward the host CC, then forgets. STATELESS: no
+// seenIds, no dedup, no cursor — the server only pushes action-lane sends and a
+// deliberate re-push (escalation/release) is just another notification we forward.
+// We gate on agentReady so we never push to a host that hasn't loaded its
+// state/guidelines yet; an announce missed while not-ready (or while the host is
+// offline at push) is recovered from the durable unread set at the host's next
+// `go`. v0.0.29 dropped the transitional [announce·<mode>] prefix + meta.source
+// (no parallel resource path left to attribute against).
 async function forwardAnnounce(p: AnnouncePacket): Promise<void> {
   if (!agentReady) {
     debugLog(`forwardAnnounce: dropped (agent not ready) msg_id=${p.msg_id} mode=${p.mode}`)
@@ -1342,26 +1222,26 @@ async function forwardAnnounce(p: AnnouncePacket): Promise<void> {
   }
   const requiresReview = p.require_human === true
   const isSystemNotice = p.is_system_notice === true
-  const markers: string[] = [`[announce·${p.mode}]`]
+  const markers: string[] = []
   if (requiresReview) markers.push('[REQUIRES REVIEW]')
   if (isSystemNotice) markers.push('[SYSTEM NOTICE]')
+  const prefix = markers.length ? `${markers.join(' ')} ` : ''
 
   let content: string
   if (p.mode === 'inject' && typeof p.body === 'string' && p.body.length > 0) {
     // inject: full body inline (latency-to-attention tier).
-    content = `${markers.join(' ')} ${p.body}`
+    content = `${prefix}${p.body}`
   } else {
     // header: no body on the wire — render a one-line header from the fields.
     const subj = p.subject ? `: ${p.subject}` : ''
     const from = `${p.from_agent}@${p.from_project ?? PROJECT}`
     const tags = `[${p.category ?? 'info'}/${p.priority ?? 'normal'}]`
-    content = `${markers.join(' ')} ${from} ${tags}${subj} (msg ${p.msg_id})`
+    content = `${prefix}${from} ${tags}${subj} (msg ${p.msg_id})`
   }
 
   // meta values must all be strings, snake_case keys (CC channel meta is
   // Record<string,string>). Null/absent optionals are omitted, not stringified.
   const meta: Record<string, string> = {
-    source: 'announce',
     mode: p.mode,
     msg_id: p.msg_id,
     from_agent: p.from_agent,
@@ -1389,80 +1269,52 @@ async function forwardAnnounce(p: AnnouncePacket): Promise<void> {
   }
 }
 
-const MAX_PAGES = 50
-
 type InboxPage = {
-  messages?: Array<Record<string, unknown>>
-  next_cursor?: string | null
-  has_more?: boolean
   error?: string
   lane_counts?: LaneCounts
 }
 
-async function readInboxAndForward() {
+// v0.0.29 — counts-only refresh (replaces the old readInboxAndForward delivery
+// path). A single read-INERT resource read that captures the server's lane_counts
+// for the badge and writes the status file. It does NOT forward messages:
+// action-lane delivery is the announce push (forwardAnnounce), and info/fyi are
+// badge-only, reconciled by the host's go-pull. lane_counts is computed
+// server-side over the FULL inbox, so page 1 of the resource is sufficient — no
+// pagination. Read-inert under per-message-unread (read_by), so glancing for the
+// badge never marks anything read and never zeroes pending_fyi_waiting.
+async function refreshLaneCounts() {
   if (!sm) return
   if (healthState === 'offline') {
-    // Server unreachable (3+ consecutive health failures). Skip delivery so
-    // the host CC doesn't autopilot-reply against a dead server — its
-    // replies would queue in the journal but the original sender is waiting
-    // and the chain breaks. On health recovery (noteHealth offline→online)
-    // this function is invoked again to drain whatever piled up.
-    debugLog(`readInboxAndForward: skipped, healthState=offline`)
+    // Server unreachable — no point reading the inbox resource. Recovery
+    // (noteHealth offline→online) calls this again.
+    debugLog(`refreshLaneCounts: skipped, healthState=offline`)
     return
   }
-  if (!agentReady) {
-    debugLog(`readInboxAndForward: skipped, agent not ready (waiting for get_session_id or send_message)`)
+  let body: InboxPage
+  try {
+    const result = await sm.readResource({ uri: INBOX_URI })
+    const text = (result.contents?.[0] as { text?: string } | undefined)?.text
+    if (!text) return
+    body = JSON.parse(text) as InboxPage
+  } catch (err) {
+    const m = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`junto-inbox: lane-counts read failed: ${m}\n`)
+    debugLog(`refreshLaneCounts: throw=${m}`)
     return
   }
-  let cursor: string | null = null
-  let pages = 0
-  let more = true
-
-  while (more && pages < MAX_PAGES) {
-    pages++
-    let body: InboxPage
-    try {
-      if (cursor === null) {
-        const result = await sm.readResource({ uri: INBOX_URI })
-        const text = (result.contents?.[0] as { text?: string } | undefined)?.text
-        if (!text) return
-        body = JSON.parse(text) as InboxPage
-      } else {
-        const res = (await callMemory('memory_get_messages', { session_id: sessionId, cursor })) as InboxPage | null
-        if (!res) return
-        body = res
-      }
-    } catch (err) {
-      const m = err instanceof Error ? err.message : String(err)
-      process.stderr.write(`junto-inbox: read failed (page ${pages}): ${m}\n`)
-      debugLog(`readInbox p${pages}: throw=${m}`)
-      return
-    }
-
-    if (body.error) {
-      process.stderr.write(`junto-inbox: read error (page ${pages}): ${body.error}\n`)
-      debugLog(`readInbox p${pages}: error=${body.error}`)
-      return
-    }
-
-    // v0.0.27 — capture the server's lane_counts for the badge. pending_action_open
-    // is watermark-independent, so it stays correct even though this read advances
-    // the watermark. deliverNew's trailing writeStatus picks this up; also refresh
-    // here for the no-messages case (counts can change with nothing to deliver).
-    if (body.lane_counts) lastLaneCounts = body.lane_counts
-
-    const messages = body.messages ?? []
-    debugLog(`readInbox p${pages}: ${messages.length} msgs (ids=${messages.map(m => m.id).join(',')}) has_more=${body.has_more === true} cursor=${body.next_cursor ?? 'null'} lane_counts=${body.lane_counts ? JSON.stringify(body.lane_counts) : 'none'}`)
-    if (messages.length > 0) await deliverNew(messages)
-    else if (body.lane_counts) writeStatus('connected')
-
-    cursor = body.next_cursor ?? null
-    more = body.has_more === true && cursor !== null
+  if (body.error) {
+    process.stderr.write(`junto-inbox: lane-counts read error: ${body.error}\n`)
+    debugLog(`refreshLaneCounts: error=${body.error}`)
+    return
   }
-
-  if (more) {
-    process.stderr.write(`junto-inbox: pagination cap (${MAX_PAGES}) hit — older messages remain unread\n`)
-    debugLog(`readInbox: pagination cap hit at ${pages} pages, has_more still true`)
+  if (body.lane_counts) {
+    lastLaneCounts = body.lane_counts
+    debugLog(`refreshLaneCounts: lane_counts=${JSON.stringify(body.lane_counts)}`)
+    writeStatus('connected')
+  } else {
+    // Old server with no lane_counts → leave the badge as-is (omitted entirely
+    // if we've never seen counts), matching the pre-lanes clean statusline.
+    debugLog(`refreshLaneCounts: no lane_counts in resource`)
   }
 }
 
@@ -1549,14 +1401,16 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.28' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.29' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
-    if (notif.params.uri === INBOX_URI) await readInboxAndForward()
+    // v0.0.29 — resource_updated now only refreshes the badge counts; it no
+    // longer forwards messages (that's the announce push). Read-inert.
+    if (notif.params.uri === INBOX_URI) await refreshLaneCounts()
   })
-  // v0.0.28 — STEP 1: server-authoritative announce push. Additive alongside the
-  // resource_updated path above (§E7). Custom-method notifications are dispatched
-  // by method literal exactly like resource_updated; an unregistered method would
-  // silently no-op, so registering this is the whole opt-in.
+  // Server-authoritative announce push (the live-delivery path). Custom-method
+  // notifications are dispatched by method literal exactly like resource_updated;
+  // an unregistered method would silently no-op, so registering this is the whole
+  // opt-in.
   client.setNotificationHandler(AnnounceNotificationSchema, async notif => {
     await forwardAnnounce(notif.params)
   })
@@ -1593,7 +1447,7 @@ async function bindAndSubscribe(): Promise<void> {
   setTimeout(() => markReady('post-subscribe-timeout'), 60_000)
 
   await drainJournal()
-  await readInboxAndForward()
+  await refreshLaneCounts()
 }
 
 async function supervisor(): Promise<void> {
@@ -1633,7 +1487,6 @@ async function shutdown(reason: string) {
   process.stderr.write(`junto-inbox: shutdown (${reason})\n`)
   stopHeartbeat()
   stopHealthPoller()
-  stopFyiDigestTimer()
   writeStatus('shutdown', { reason })
   try {
     if (sm && sessionId) await callMemory('memory_end_session', { session_id: sessionId, summary: 'junto-inbox shutting down' })
@@ -1648,7 +1501,6 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'))
 migrateOutboxToJournal()
 loadJournal()
 startHealthPoller()
-startFyiDigestTimer()
 await mcp.connect(new StdioServerTransport())
 void supervisor()
 process.stderr.write(`junto-inbox: subscribe-mode for ${PROJECT}/${AGENT}\n`)

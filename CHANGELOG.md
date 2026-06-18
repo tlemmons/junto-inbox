@@ -3,87 +3,47 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
-## v0.0.29
+## v0.0.30
 
-Server-authoritative delivery — **step 2** (the strip) of
-`design:server-authoritative-delivery-v0` v0.5.3 (§E / §SEQUENCING).
+`attach_session` — a new **primary startup call** that fixes agents coming up
+without the server guidelines. Background: agents launched via the plugin path
+called `get_session_id`, which returns only `{status, session_id, project,
+agent}`. Unlike `memory_start_session`, it carried **no guidelines** — so the
+fleet repeatedly came up missing `mandatory_memory_query` ("MEMORY FIRST"),
+`anti_sycophancy`, `db_write_safety`, etc., and agents re-asked Tom for keys /
+paths / build steps already recorded in junto. (`backlog_c3d7bca5ab9c`,
+Tom-decided 2026-06-18.)
 
-The inject-latency smoke-test gate passed (a `notifications/junto/announce`
-push surfaced at the host's next turn boundary mid-long-turn, full body inline),
-so the announce push is now the **sole live-delivery path** and the old
-window-read delivery is removed. This closes the v0.0.28 transitional
-double-emit window.
+### `attach_session` (new)
 
-Changes:
+Returns the full onboarding bundle: `{status:"ready", session_id, project,
+agent, ...the memory_start_session response}` — i.e. guidelines + active locks +
+signals + interface_updates. A true **drop-in for `memory_start_session`** minus
+the duplicate-session creation (the plugin already opened the session at bind),
+and it **replaces the old two-step** of `get_session_id` then `memory_guidelines`.
 
-- **Deleted `deliverNew` + `seenIds`.** The `resource_updated` path no longer
-  forwards messages, so there is nothing to dedup. Action-lane messages arrive
-  live via the announce handler; info/fyi are badge-only and reconciled by the
-  host's `go`-pull of the durable unread set.
-- **Deleted the plugin FYI digest entirely** — `fyiQueue`, `flushFyiDigest`,
-  the 15-min timer, the 10-cap, the `JUNTO_FYI_DIGEST` kill switch, the
-  `FyiItem` type. FYI is **badge-only** (no plugin digest, no server digest).
-- **`readInboxAndForward` → `refreshLaneCounts`.** A single read-inert resource
-  read that captures the server's `lane_counts` for the badge and writes the
-  status file — no message emit, no pagination (counts are server-computed over
-  the full inbox). Wired to the same callers (`resource_updated`, bind,
-  `markReady`, health-recovery).
-- **Badge `M` = server `lane_counts.pending_fyi_waiting`.** Under per-message
-  unread (`read_by`) the count is read-inert through the resource read, so the
-  plugin's glancing refresh never zeroes it — retiring the v0.0.27
-  `fyiQueue`-as-`M` workaround.
-- **Soft FYI-aging nudge.** `lane_counts` now also carries
-  `pending_fyi_oldest_age_hours` + `fyi_ttl_hours` (=48); the statusline turns
-  the FYI badge yellow and appends `·aging` once the oldest waiting FYI reaches
-  75% of the TTL, so info isn't lost unseen.
-- **`forwardAnnounce`** drops the transitional `[announce·<mode>]` content
-  prefix and `meta.source="announce"` (no parallel path left to attribute).
+The bundle is the `memory_start_session` response **cached at bind**, not a live
+re-fetch: `memory_guidelines list` returns the *unfiltered superset* (every
+project's scoped rules), so the plugin must not re-derive the applicable set —
+the server already computed it (global + this project) at bind. Guidelines are
+therefore **bind-time fresh** (refreshed on every reconnect/restart). Going from
+*absent* → *bind-time* is the fix, and it matches exactly what `start_session`
+would have returned at the same moment.
 
-The plugin now holds **zero message state**: connection management, the
-announce handler → CC channel emit, and statusline rendering of server counts.
-A missed/dropped announce is recovered by durable-unread at the next `go`-pull
-(the unread write is independent of push), so removing the window-read fallback
-is safe — worst case is a delayed wake, never a lost message.
+Same liveness contract as `get_session_id` (`markReady` + a `memory_heartbeat`
+probe; `{status:"not_ready"}` with a `memory_start_session` fallback if the
+plugin has not bound yet).
 
-Net −134 LOC. `bun build` clean; `tsc` 0 new errors vs the v0.0.28 baseline.
-Like step 1, the flip takes effect on the next CC restart.
+### `get_session_id` (kept, demoted)
 
-## v0.0.28
+Unchanged return shape (`{status, session_id, project, agent}`) — fully
+backward-compatible. Now documented as the narrow pure id/readiness accessor for
+re-fetching a session id after a reconnect; **startup should call
+`attach_session`**.
 
-Server-authoritative announce handler — **step 1** of
-`design:server-authoritative-delivery-v0` v0.5.3 (§E). Smoke-test prep; no
-removals yet.
-
-The server now **content-pushes** a custom JSON-RPC notification,
-`notifications/junto/announce`, over the SSE stream to each connected
-subscriber on every action-lane send (info/fyi are not pushed — badge-only).
-This release registers a handler for it. The params are flat under `params`
-(no wrapper): `{mode, from_agent, from_project, category, priority, msg_id,
-chain_depth, in_response_to, obligation_state, subject, require_human,
-is_system_notice, created_at}` + inline `body` iff `mode === "inject"`. On
-receipt the handler emits a single `notifications/claude/channel` — full body
-inline for `inject`, a one-line header for `header` — then forgets. It is
-**stateless**: no `seenIds`, no cursor, no dedup (a deliberate re-push is just
-another notification we forward).
-
-The handler is **additive** alongside the existing
-`resource_updated` → `readInboxAndForward` path (§E7), so a server-new /
-plugin-old state degrades to quiet, never a flood. During this transitional
-step an **action message double-emits** — once via the announce handler, once
-via the resource path (info does not double). To keep that attributable through
-the parallel run, announce-sourced emits carry `meta.source="announce"` and a
-`[announce·<mode>]` content prefix; both are removed in step 2.
-
-The notification schema reuses the SDK's own zod (4.3.6) via
-`NotificationSchema.extend`, with lenient params (only `mode` / `from_agent` /
-`msg_id` required, the rest nullish, loose object) so a minor server type
-surprise degrades the render rather than throwing inside the SDK handler and
-dropping the live wake. `zod` is promoted to a direct dependency.
-
-**Step 2** (gated on the inject-latency smoke test passing): strip `seenIds` +
-the plugin FYI digest + `fyiQueue`-as-M, drop the
-window-read-on-`resource_updated` announce path, and render the server's
-`lane_counts` (M = `pending_fyi_waiting`) plus the soft FYI-aging nudge.
+Launcher templates and CLAUDE.md `go` macros repoint to `attach_session`
+separately (parts b/c of `backlog_c3d7bca5ab9c`), each with a graceful fallback
+for boxes still on an older plugin.
 
 ## v0.0.27
 

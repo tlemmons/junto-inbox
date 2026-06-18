@@ -1,6 +1,6 @@
 {
   "name": "junto-inbox",
-  "version": "0.0.29",
+  "version": "0.0.30",
   "description": "Channel plugin that forwards messages from a junto-memory MCP server into Claude Code via the Channels research preview. Enables multi-agent coordination across Claude Code sessions.",
   "author": {
     "name": "Tom Lemmons",

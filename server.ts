@@ -7,6 +7,32 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.30 — attach_session: the new PRIMARY startup call (backlog_c3d7bca5ab9c,
+ *          Tom-decided 2026-06-18). PROBLEM it fixes: agents starting via the
+ *          plugin path called get_session_id, which returns only {status,
+ *          session_id, project, agent} — so they came up WITHOUT the server
+ *          guidelines (mandatory_memory_query/"MEMORY FIRST", anti_sycophancy,
+ *          db_write_safety, …) that memory_start_session returns. Result: agents
+ *          re-asked Tom for keys/paths/build-steps already in junto. FIX: a new
+ *          attach_session tool returns the FULL onboarding bundle — {status,
+ *          session_id, project, agent, ...the cached memory_start_session
+ *          response} (guidelines + locks + signals + interface_updates) — a true
+ *          drop-in for start_session minus the duplicate-session creation, since
+ *          the plugin already opened the session at bind. DESIGN NOTES: (1) the
+ *          bundle is the start_session response CACHED at bindAndSubscribe (new
+ *          module var sessionOnboarding), NOT a live re-fetch — memory_guidelines
+ *          list returns the UNFILTERED superset (all projects' scoped rules), so
+ *          the plugin must not re-derive the applicable set; the server already
+ *          computed it at bind. Guidelines are therefore bind-time fresh (refresh
+ *          on every reconnect/restart), which is the right tradeoff: absent →
+ *          bind-time is the fix, and it matches exactly what start_session would
+ *          have returned at the same moment. (2) get_session_id is KEPT, UNCHANGED
+ *          (byte-for-byte same return) and demoted to a pure id/readiness accessor
+ *          — backward-compatible for existing callers. (3) attach_session shares
+ *          get_session_id's liveness contract (markReady + heartbeatOnce probe +
+ *          not_ready fallback). Launcher templates + CLAUDE.md go macros repoint
+ *          to attach_session separately (parts b/c of the backlog item). Client
+ *          version strings 0.0.29 → 0.0.30 (3 sites).
  * v0.0.29 — server-authoritative delivery, STEP 2 (the strip) of
  *          design:server-authoritative-delivery-v0 v0.5.3 (§E/§SEQUENCING). The
  *          inject-latency smoke-test gate PASSED (announce surfaced at the host's
@@ -720,7 +746,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.29' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.30' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -804,6 +830,12 @@ function stopHealthPoller(): void {
 
 let sm: Client | null = null
 let sessionId: string | null = null
+// v0.0.30: the full memory_start_session response captured at bindAndSubscribe,
+// minus nothing — attach_session hands it back so the host gets the server
+// guidelines + locks/signals/interface_updates without opening a duplicate
+// session. Server-computed applicable guideline set; bind-time fresh (re-set on
+// every reconnect, cleared on disconnect). NOT a live re-fetch (see v0.0.30 note).
+let sessionOnboarding: Record<string, unknown> | null = null
 let agentReady = false
 // v0.0.22: distinguishes "never connected" (boot-failed) from "previously
 // connected, currently disconnected" (reconnecting) in the supervisor catch.
@@ -868,7 +900,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.29' },
+  { name: 'junto-inbox', version: '0.0.30' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -907,11 +939,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'attach_session',
+      description:
+        'PRIMARY STARTUP CALL — call this first, instead of memory_start_session. ' +
+        'Attaches the host CC to the junto-inbox plugin\'s already-open shared-memory ' +
+        'session and returns the full onboarding bundle: {status:"ready", session_id, ' +
+        'project, agent, guidelines (server-managed behavioral rules you MUST read and ' +
+        'obey), plus active locks / signals / interface_updates}. A true drop-in for ' +
+        'memory_start_session minus the duplicate-session creation, and it REPLACES the ' +
+        'old two-step (get_session_id then memory_guidelines) — guidelines now come back ' +
+        'in the same call. Use the returned session_id for ALL mcp__junto__memory_* calls. ' +
+        'Returns {status:"not_ready"} if the plugin has not bound yet (cold start / ' +
+        'mid-reconnect) — call once more after a short delay, then fall back to ' +
+        'memory_start_session. Guidelines are bind-time fresh (refresh on plugin ' +
+        'reconnect/restart).',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    {
       name: 'get_session_id',
       description:
-        'Returns the junto-inbox plugin\'s active shared-memory session_id, project, and agent. ' +
-        'Call this from the host CC\'s startup macro instead of memory_start_session to avoid ' +
-        'opening a duplicate session for the same (project, agent). Returns ' +
+        'Pure id/readiness accessor: returns {status, session_id, project, agent} only — ' +
+        'NO guidelines bundle. For STARTUP use attach_session instead (it returns the ' +
+        'guidelines too). Use get_session_id for the narrow case of re-fetching the ' +
+        'session id after the plugin reconnected and the prior id went stale. Returns ' +
         '{status:"not_ready"} if the plugin has not yet bound (cold start or mid-reconnect) — ' +
         'caller should retry after a short delay or fall back to memory_start_session.',
       inputSchema: { type: 'object', properties: {}, required: [] },
@@ -961,6 +1011,47 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (req.params.name === 'attach_session') {
+    // attach_session (v0.0.30, backlog_c3d7bca5ab9c) — the primary startup call.
+    // True drop-in for memory_start_session's onboarding minus the duplicate
+    // session: the plugin opened the session at bind and cached that response in
+    // sessionOnboarding; the host ATTACHES and gets briefed (session_id + server
+    // guidelines + locks/signals/interface_updates). Same liveness contract as
+    // get_session_id: it is also a "host is live" signal, so markReady, and the
+    // session may have been ended by a prior /clear+go persona, so heartbeat-probe
+    // before handing back.
+    markReady('attach_session')
+    if (sessionId && sm) {
+      try {
+        await heartbeatOnce()
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err)
+        forceReconnect(`attach_session liveness check failed (${m})`)
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ status: 'not_ready', project: PROJECT, agent: AGENT }) }],
+        }
+      }
+    }
+    if (!sessionId) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ status: 'not_ready', project: PROJECT, agent: AGENT }) }],
+      }
+    }
+    // Spread the cached start_session onboarding (guidelines/locks/signals/
+    // interface_updates, and its own session_id == sessionId), then pin the
+    // canonical readiness/identity fields on top so they always win.
+    const bundle = {
+      ...(sessionOnboarding ?? {}),
+      status: 'ready',
+      session_id: sessionId,
+      project: PROJECT,
+      agent: AGENT,
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(bundle) }],
+    }
+  }
+
   if (req.params.name === 'get_session_id') {
     // get_session_id is the canonical "I am live" signal from the host CC's
     // go macro. Even if the plugin's underlying session isn't ready yet,
@@ -1401,7 +1492,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.29' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.30' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     // v0.0.29 — resource_updated now only refreshes the badge counts; it no
     // longer forwards messages (that's the announce push). Read-inert.
@@ -1426,6 +1517,11 @@ async function bindAndSubscribe(): Promise<void> {
   })
   sessionId = (start as { session_id?: string } | null)?.session_id ?? null
   if (!sessionId) throw new Error('no session_id returned from memory_start_session')
+  // v0.0.30: stash the whole onboarding response for attach_session. This is the
+  // server's already-computed applicable guideline set (global + this project)
+  // plus locks/signals/interface_updates — handed back verbatim so attach_session
+  // is a true drop-in for start_session without a second session.
+  sessionOnboarding = start && typeof start === 'object' ? (start as Record<string, unknown>) : null
 
   await client.subscribeResource({ uri: INBOX_URI })
   process.stderr.write(`junto-inbox: connected, session=${sessionId}, subscribed=${INBOX_URI}\n`)
@@ -1473,6 +1569,7 @@ async function supervisor(): Promise<void> {
       writeStatus(failState, { error: errMsg, backoff_ms: backoff, source: 'supervisor' })
       sm = null
       sessionId = null
+      sessionOnboarding = null // stale once the session is gone; re-set on rebind
       // Keep agentReady true across reconnects. The host CC owns the plugin's
       // process lifetime, so a live plugin implies a live host. Resetting
       // agentReady stranded coordinator-class agents whose `go` macro fired

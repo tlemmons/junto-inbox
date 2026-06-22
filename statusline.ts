@@ -71,6 +71,9 @@ type Status = {
   }
   lanes?: {
     action_open?: number
+    // v0.0.31 — blocker statusline. Subset of action_open; absent (old
+    // server / pre-deploy) → rendered as 0 (no badge).
+    blocker_open?: number
     fyi_waiting?: number
     // v0.0.29 — soft FYI-aging guidance (passed through from the server's
     // lane_counts). When the oldest waiting FYI nears the TTL, the badge hints
@@ -152,13 +155,21 @@ if (em && typeof em.count === 'number' && typeof em.push_budget === 'number') {
 // When the oldest FYI nears the server's TTL (>=75%), the FYI part turns yellow
 // and gains a "·aging" hint so info isn't lost unseen. Omitted entirely when both
 // are 0 so a quiet inbox keeps a clean line.
+// v0.0.31 — blocker statusline (Tom UX): when blocker_open > 0, prepend a RED
+// `${n} BLOCKER` headline. blocker_open is a SUBSET of action_open, and `open`
+// intentionally stays the FULL action total (Tom's render choice: headline +
+// full open), so a live blocker shows in BOTH parts by design — no subtraction,
+// no assumption about the server's action/blocker math. Absent field (old
+// server / pre-deploy) → 0 → no BLOCKER part, identical to the old line.
 let laneBadge = ''
 const ln = payload.lanes
 if (ln) {
+  const blocker = typeof ln.blocker_open === 'number' ? ln.blocker_open : 0
   const open = typeof ln.action_open === 'number' ? ln.action_open : 0
   const fyi = typeof ln.fyi_waiting === 'number' ? ln.fyi_waiting : 0
-  if (open > 0 || fyi > 0) {
+  if (blocker > 0 || open > 0 || fyi > 0) {
     const parts: string[] = []
+    if (blocker > 0) parts.push(`${RED}${blocker} BLOCKER${RESET}`)
     if (open > 0) parts.push(`${YELLOW}${open} open${RESET}`)
     if (fyi > 0) {
       const age = ln.fyi_oldest_age_hours

@@ -3,6 +3,25 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.31
+
+Blocker statusline (Tom UX) — a high-signal **BLOCKER** badge in the statusline,
+the plugin half of a two-part change (server half computes the count). Blockers
+are usually 0, so a quiet inbox is unchanged; the badge only appears when a
+blocker is actually owed to you.
+
+- **Status writer**: `LaneCounts` gains `pending_blocker_open` — the server's
+  count of unresolved blockers addressed to this agent (`category=blocker`,
+  obligation ∈ `open|responded|None`), a **subset** of `pending_action_open`.
+  The status file's `lanes` block now carries `blocker_open = pending_blocker_open ?? 0`.
+- **Renderer** (`statusline.ts`): when `blocker_open > 0`, the badge prepends a
+  red `N BLOCKER` headline, e.g. `[2 BLOCKER · 5 open · 1 FYI]`. `open` stays the
+  **full** `action_open` total (no subtraction), so a live blocker shows in both
+  parts by design — robust to the server's action/blocker accounting.
+- **Back-compat**: the field is absent until the server deploys its half. Absent
+  (or an old server) → `0` → no BLOCKER part, identical to the prior line. Safe
+  to run ahead of the server deploy.
+
 ## v0.0.30
 
 `attach_session` — a new **primary startup call** that fixes agents coming up

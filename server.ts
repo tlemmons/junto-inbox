@@ -7,6 +7,16 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.31 — blocker statusline (Tom UX, msg_709fcaee2baf). Plugin half of a
+ *          high-signal BLOCKER badge. (1) LaneCounts gains pending_blocker_open
+ *          (subset of pending_action_open: category=blocker, obligation ∈
+ *          open|responded|None — server-computed). (2) the status file's `lanes`
+ *          block gains blocker_open = pending_blocker_open ?? 0. (3) statusline.ts
+ *          prepends a RED `${n} BLOCKER` headline when >0; `open` stays the FULL
+ *          action_open (Tom render choice: headline + full open, no subtraction).
+ *          Back-compat: absent field (server pre-deploy / old server) → 0 → no
+ *          BLOCKER part, identical to the prior line. Field lights up only once
+ *          the server deploys pending_blocker_open. Version strings 0.0.30 → 0.0.31.
  * v0.0.30 — attach_session: the new PRIMARY startup call (backlog_c3d7bca5ab9c,
  *          Tom-decided 2026-06-18). PROBLEM it fixes: agents starting via the
  *          plugin path called get_session_id, which returns only {status,
@@ -491,6 +501,10 @@ type EmissionSnapshot = {
 type LaneCounts = {
   pending_action_open?: number
   pending_action_responded?: number
+  // v0.0.31 — blocker statusline (Tom UX). Subset of pending_action_open:
+  // unresolved blockers addressed to this agent (category=blocker, obligation
+  // ∈ open|responded|None). Absent on pre-deploy/old servers → treated as 0.
+  pending_blocker_open?: number
   pending_fyi_waiting?: number
   // v0.0.29 — soft FYI-aging guidance (not a force; nothing auto-expires here).
   // The server reports the oldest waiting FYI's age and the info TTL so the
@@ -545,6 +559,10 @@ function writeStatus(state: PluginStatus, extras: Record<string, unknown> = {}):
     const lanes = lastLaneCounts
       ? {
           action_open: lastLaneCounts.pending_action_open ?? 0,
+          // v0.0.31 — blocker_open: subset of action_open (high-signal, usually
+          // 0). `?? 0` keeps the field present+zero for a deployed server and
+          // back-compat for a pre-deploy one (no pending_blocker_open → 0).
+          blocker_open: lastLaneCounts.pending_blocker_open ?? 0,
           fyi_waiting: lastLaneCounts.pending_fyi_waiting ?? 0,
           ...(typeof lastLaneCounts.pending_fyi_oldest_age_hours === 'number'
             ? { fyi_oldest_age_hours: lastLaneCounts.pending_fyi_oldest_age_hours }
@@ -746,7 +764,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.30' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.31' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -900,7 +918,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.30' },
+  { name: 'junto-inbox', version: '0.0.31' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1492,7 +1510,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.30' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.31' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     // v0.0.29 — resource_updated now only refreshes the badge counts; it no
     // longer forwards messages (that's the announce push). Read-inert.

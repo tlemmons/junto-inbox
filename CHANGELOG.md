@@ -3,6 +3,43 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.32
+
+API-key file source (security) — the plugin's shared-memory API key can now be
+read from a **file** instead of only the environment.
+
+**Why:** the key was sourced only from `JUNTO_API_KEY` env. `process.env` is
+inherited by every child the `claude` process spawns (the Bash tool, hooks,
+other MCP servers), so an env-only key is a real exfil surface. With a file
+source the launcher no longer puts the secret in `claude`'s env — children
+inherit only the *path*.
+
+- **`resolveApiKey()`** with precedence (**file-wins**): **`JUNTO_API_KEY_FILE`**
+  (a path to a file holding the key; children inherit only the *path*) wins,
+  **falling back to `JUNTO_API_KEY`** (direct env, back-compat) when the file is
+  absent/empty/unreadable, else `null` (keyless).
+- **File-wins enables a zero-downtime rollout**: a launcher can set **both**
+  during a mixed-plugin-version migration — old plugins (≤0.0.31, env-only) read
+  the env var while new plugins prefer the file — so no box loses its key mid-
+  upgrade.
+- **No silent default path** — only an explicit `JUNTO_API_KEY_FILE` is honored.
+  (`~/.junto` is the launcher git clone; a stale key file there would be
+  hard-rejected by the server — an invalid key is a 401 with no keyless
+  fallback.)
+- **Keyless-resilient**: a missing/unreadable `JUNTO_API_KEY_FILE` target logs a
+  stderr warning and **falls back** (to `JUNTO_API_KEY`, then keyless), never a
+  hard exit — open-auth servers (home/sage) accept keyless launches.
+- **Trimmed**: file contents are `.trim()`'d (key files carry a trailing
+  newline; an untrimmed key would be invalid). An empty/whitespace-only file
+  means keyless.
+- **Perms warning**: on POSIX, warns if the key file is group/world-readable
+  (`chmod 600` recommended); skipped on Windows where mode bits are meaningless.
+- The key value is never logged (only its source/path, and only under
+  `JUNTO_DEBUG=1`).
+
+Registry source (Windows registry / CC MCP registry) is out of scope. Back-compat:
+launchers still setting `JUNTO_API_KEY` are unaffected. Version strings 0.0.31 → 0.0.32.
+
 ## v0.0.31
 
 Blocker statusline (Tom UX) — a high-signal **BLOCKER** badge in the statusline,

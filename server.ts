@@ -7,6 +7,25 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.32 — API-key file source (backlog_80f9bbb265cc, security). The plugin's
+ *          shared-memory API key was env-only (JUNTO_API_KEY), and process.env
+ *          is inherited by every child claude spawns (Bash tool, hooks, other
+ *          MCP servers) — an env-only key is a real exfil surface. New: a
+ *          resolveApiKey() with precedence JUNTO_API_KEY_FILE (a path to a file
+ *          holding the key; children inherit only the PATH, not the secret) WINS,
+ *          falling back to JUNTO_API_KEY (direct env, back-compat) when the file
+ *          is absent/empty/unreadable, else null (keyless). FILE-WINS is
+ *          deliberate: a launcher can set BOTH during a mixed-plugin-version
+ *          rollout — old plugins (≤0.0.31, env-only) read the env var, new
+ *          plugins prefer the file — a zero-downtime migration. Deliberately NO
+ *          silent default path (~/.junto is the launcher git clone; a stale key
+ *          there would be hard-rejected — invalid key → 401, no keyless
+ *          fallback). A set-but-broken _FILE → stderr warn + FALL BACK (to env,
+ *          then keyless), never hard-exit (launcher allows keyless on open-auth
+ *          servers). File contents trimmed (key files carry a trailing newline;
+ *          untrimmed → invalid → 401). POSIX perms warning if the key file is
+ *          group/world-readable (skipped on win32). Registry source out of scope.
+ *          Version strings 0.0.31 → 0.0.32.
  * v0.0.31 — blocker statusline (Tom UX, msg_709fcaee2baf). Plugin half of a
  *          high-signal BLOCKER badge. (1) LaneCounts gains pending_blocker_open
  *          (subset of pending_action_open: category=blocker, obligation ∈
@@ -413,7 +432,7 @@ import {
   NotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { homedir } from 'os'
 import {
@@ -451,11 +470,82 @@ if (DEBUG) {
   debugLog(`pid=${process.pid} cwd=${process.cwd()} env=${JSON.stringify(juntoEnv)}`)
 }
 
+// Read a bare API key from a file. Returns the trimmed key, or null (with a
+// warning + debug line) if the file is missing / unreadable / empty. Never logs
+// the key value — only its source/path.
+function readKeyFile(path: string): string | null {
+  if (!existsSync(path)) {
+    process.stderr.write(
+      `junto-inbox: JUNTO_API_KEY_FILE points to a missing file (${path}); falling back to JUNTO_API_KEY / keyless\n`,
+    )
+    debugLog(`api-key: JUNTO_API_KEY_FILE missing (${path}) -> fallback`)
+    return null
+  }
+
+  // Best-effort perms warning: a key file readable by group/other is a leak.
+  // mode bits are only meaningful on POSIX; skip on Windows.
+  if (process.platform !== 'win32') {
+    try {
+      const mode = statSync(path).mode
+      if ((mode & 0o077) !== 0) {
+        process.stderr.write(
+          `junto-inbox: JUNTO_API_KEY_FILE (${path}) is group/world-readable; chmod 600 recommended\n`,
+        )
+      }
+    } catch {
+      // best-effort only
+    }
+  }
+
+  let contents: string
+  try {
+    contents = readFileSync(path, 'utf8')
+  } catch (err) {
+    process.stderr.write(
+      `junto-inbox: JUNTO_API_KEY_FILE (${path}) unreadable (${(err as Error).message}); falling back to JUNTO_API_KEY / keyless\n`,
+    )
+    debugLog(`api-key: JUNTO_API_KEY_FILE unreadable (${path}) -> fallback`)
+    return null
+  }
+
+  // Trim: key files carry a trailing newline; an untrimmed key is invalid and
+  // hard-rejected server-side. Tokens are opaque and whitespace-free, so trim
+  // is safe. An empty/whitespace-only file falls back.
+  const key = contents.trim()
+  if (key === '') {
+    debugLog(`api-key: JUNTO_API_KEY_FILE (${path}) empty -> fallback`)
+    return null
+  }
+  debugLog(`api-key: sourced from JUNTO_API_KEY_FILE (${path})`)
+  return key
+}
+
+// Resolve the shared-memory API key without forcing it into the process env
+// (env is inherited by every child claude spawns — Bash, hooks, other MCP
+// servers — so an env-only key is a real exfil surface, backlog_80f9bbb265cc).
+// Precedence: JUNTO_API_KEY_FILE (a path to a file holding the key; children
+// inherit only the PATH) WINS, falling back to JUNTO_API_KEY (direct env) when
+// the file is absent/empty/unreadable, else null (keyless). File-wins lets a
+// launcher set BOTH during a mixed-plugin-version rollout: old plugins (≤0.0.31,
+// env-only) read the env var while new plugins prefer the file — a zero-downtime
+// migration. No silent default path: ~/.junto is the launcher git clone, and a
+// stale key file there would be hard-rejected (invalid key → 401, no keyless
+// fallback). A set-but-broken JUNTO_API_KEY_FILE warns but falls back rather than
+// hard-exiting (the launcher deliberately allows keyless launch on open-auth servers).
+function resolveApiKey(): string | null {
+  const keyFile = envVar('API_KEY_FILE')
+  if (keyFile !== undefined) {
+    const fromFile = readKeyFile(keyFile)
+    if (fromFile !== null) return fromFile
+  }
+  return envVar('API_KEY') ?? null
+}
+
 const URL_DEFAULT = 'http://localhost:8080/mcp'
 const SHARED_URL = envVar('SHARED_MEMORY_URL') ?? URL_DEFAULT
 const PROJECT = envVar('PROJECT')
 const AGENT = envVar('AGENT')
-const API_KEY = envVar('API_KEY') ?? null
+const API_KEY = resolveApiKey()
 const ROLE = envVar('ROLE') ?? null
 
 if (!PROJECT || !AGENT) {
@@ -764,7 +854,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.31' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.32' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -918,7 +1008,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.31' },
+  { name: 'junto-inbox', version: '0.0.32' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1510,7 +1600,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.31' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.32' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     // v0.0.29 — resource_updated now only refreshes the badge counts; it no
     // longer forwards messages (that's the announce push). Read-inert.

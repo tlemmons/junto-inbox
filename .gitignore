@@ -2,3 +2,9 @@ node_modules/
 junto-inbox-debug.log
 cterm-inbox-debug.log
 *.log
+
+# per-workspace agent identity / harness state
+.agent-name
+.project-name
+.claude/
+CLAUDE.md

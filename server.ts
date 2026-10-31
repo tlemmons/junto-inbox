@@ -7,6 +7,17 @@
  * Part of the Junto suite (umbrella brand for the multi-agent stack: junto-memory
  * MCP server, junto-inbox channel plugin, junto-control dashboard).
  *
+ * v0.0.33 — context self-report (interface:context-self-report-v0). The plugin
+ *          reports its own agent's context so the idle-park nudge has a gauge
+ *          on any OS, not only Linux boxes with the per-box reporter.
+ *          (1) statusline.ts writes <dir>/.claude/context-metrics.json (fleet
+ *          schema, atomic) when it IS the CC statusline (real stdin payload);
+ *          a wrapper statusline that calls it with empty stdin owns the file.
+ *          (2) Each 30s heartbeat: reportContextOnce() reads the file from
+ *          CLAUDE_PROJECT_DIR || cwd and calls memory_report_context for
+ *          AGENT only, when written_at is newer and <10 min old, and the file's
+ *          agent matches. (3) Bind passes timezone= (JUNTO_TIMEZONE overrides
+ *          Intl detection). Version strings 0.0.32 → 0.0.33.
  * v0.0.32 — API-key file source (backlog_80f9bbb265cc, security). The plugin's
  *          shared-memory API key was env-only (JUNTO_API_KEY), and process.env
  *          is inherited by every child claude spawns (Bash tool, hooks, other
@@ -548,6 +559,22 @@ const AGENT = envVar('AGENT')
 const API_KEY = resolveApiKey()
 const ROLE = envVar('ROLE') ?? null
 
+// v0.0.33 — interface:context-self-report-v0 §4. IANA zone passed on bind so the
+// server's idle-park nudge can give a DAY/NIGHT verdict in the agent's local time.
+// JUNTO_TIMEZONE overrides; detection failure → null → param omitted (the server
+// stores nothing). An invalid override comes back as timezone_warning, unstored.
+function resolveTimezone(): string | null {
+  const override = envVar('TIMEZONE')
+  if (override) return override
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+    return typeof tz === 'string' && tz !== '' ? tz : null
+  } catch {
+    return null
+  }
+}
+const TIMEZONE = resolveTimezone()
+
 if (!PROJECT || !AGENT) {
   process.stderr.write('junto-inbox: JUNTO_PROJECT and JUNTO_AGENT must be set\n')
   debugLog(`pid=${process.pid} EXIT 2: missing JUNTO_PROJECT or JUNTO_AGENT`)
@@ -854,7 +881,7 @@ async function probeServerHealth(): Promise<boolean> {
   try {
     if (!healthClient) {
       const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-      const client = new Client({ name: 'junto-inbox-health', version: '0.0.32' }, { capabilities: {} })
+      const client = new Client({ name: 'junto-inbox-health', version: '0.0.33' }, { capabilities: {} })
       await client.connect(transport)
       healthClient = client
     }
@@ -1008,7 +1035,7 @@ function unwrapToolError(res: { isError?: boolean; content?: unknown }): string 
 }
 
 const mcp = new Server(
-  { name: 'junto-inbox', version: '0.0.32' },
+  { name: 'junto-inbox', version: '0.0.33' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
     instructions:
@@ -1579,6 +1606,71 @@ async function fetchEmissionSnapshot(): Promise<EmissionSnapshot | null> {
   }
 }
 
+// v0.0.33 — interface:context-self-report-v0 producer half. The statusline (CC's
+// statusLine command: ~/.claude/statusline.sh, or statusline.ts when it IS the
+// statusline) writes <dir>/.claude/context-metrics.json atomically every render.
+// Each heartbeat tick we read it and, when it carries a NEWER written_at than we
+// last sent AND is <10 min old, self-report via memory_report_context. At most one
+// call per tick; missing/unchanged/stale/foreign file → send nothing.
+// Dir resolution: CLAUDE_PROJECT_DIR (if CC exports it to MCP servers) else
+// process.cwd() — the CC docs don't specify a stdio MCP server's cwd.
+// Identity guard: the file is keyed by folder, not agent, so a file whose `agent`
+// names someone else (two agents sharing a folder) is skipped.
+// Failures are debug-log-only and never affect the heartbeat (caller catches).
+const CONTEXT_MAX_AGE_MS = 10 * 60_000
+let lastContextWrittenAt: string | null = null
+
+function contextMetricsPath(): string {
+  const base = process.env.CLAUDE_PROJECT_DIR || process.cwd()
+  return join(base, '.claude', 'context-metrics.json')
+}
+
+async function reportContextOnce(): Promise<void> {
+  if (!sm || !sessionId) return
+  const path = contextMetricsPath()
+  let m: Record<string, unknown>
+  try {
+    if (!existsSync(path)) return
+    // Strip a UTF-8 BOM defensively (a BOM'd file makes JSON.parse throw).
+    m = JSON.parse(readFileSync(path, 'utf8').replace(/^﻿/, '')) as Record<string, unknown>
+  } catch (err) {
+    debugLog(`context: unreadable ${path} (${err instanceof Error ? err.message : String(err)})`)
+    return
+  }
+  const writtenAt = typeof m.written_at === 'string' ? m.written_at : null
+  const tokens = m.context_tokens
+  const window = m.context_window
+  if (!writtenAt || typeof tokens !== 'number' || typeof window !== 'number' || window <= 0) return
+  if (writtenAt === lastContextWrittenAt) return
+  const writtenMs = Date.parse(writtenAt)
+  if (!Number.isFinite(writtenMs) || Date.now() - writtenMs > CONTEXT_MAX_AGE_MS) return
+  if (lastContextWrittenAt !== null && writtenMs <= Date.parse(lastContextWrittenAt)) return
+  const fileAgent = typeof m.agent === 'string' ? m.agent : ''
+  if (fileAgent !== '' && fileAgent !== AGENT) {
+    debugLog(`context: skip, file agent=${fileAgent} != ${AGENT}`)
+    lastContextWrittenAt = writtenAt
+    return
+  }
+  const report: Record<string, unknown> = {
+    instance: AGENT,
+    context_tokens: tokens,
+    context_window: window,
+    written_at: writtenAt,
+  }
+  if (typeof m.context_pct === 'number') report.context_pct = m.context_pct
+  const res = (await callMemory('memory_report_context', {
+    session_id: sessionId,
+    reports: [report],
+  })) as { reported?: unknown; skipped?: unknown } | string | null
+  if (typeof res === 'string' && /^ERROR:/i.test(res)) {
+    // Don't advance the watermark: retry this written_at on the next tick.
+    debugLog(`context: report error ${res.slice(0, 200)}`)
+    return
+  }
+  lastContextWrittenAt = writtenAt
+  debugLog(`context: reported tokens=${tokens} written_at=${writtenAt} res=${JSON.stringify(res)?.slice(0, 200)}`)
+}
+
 function startHeartbeat(onFailure: (err: Error) => void): void {
   stopHeartbeat()
   heartbeatTimer = setInterval(() => {
@@ -1586,6 +1678,11 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
       .then(async () => {
         lastEmission = await fetchEmissionSnapshot()
         writeStatus('connected')
+        try {
+          await reportContextOnce()
+        } catch (err) {
+          debugLog(`context: report failed (${err instanceof Error ? err.message : String(err)})`)
+        }
       })
       .catch((err: unknown) => {
         const m = err instanceof Error ? err.message : String(err)
@@ -1600,7 +1697,7 @@ function startHeartbeat(onFailure: (err: Error) => void): void {
 
 async function bindAndSubscribe(): Promise<void> {
   const transport = new StreamableHTTPClientTransport(new URL(SHARED_URL))
-  const client = new Client({ name: 'junto-inbox-client', version: '0.0.32' }, { capabilities: {} })
+  const client = new Client({ name: 'junto-inbox-client', version: '0.0.33' }, { capabilities: {} })
   client.setNotificationHandler(ResourceUpdatedNotificationSchema, async notif => {
     // v0.0.29 — resource_updated now only refreshes the badge counts; it no
     // longer forwards messages (that's the announce push). Read-inert.
@@ -1622,7 +1719,10 @@ async function bindAndSubscribe(): Promise<void> {
     task_description: 'junto-inbox channel plugin',
     ...(ROLE ? { role_description: ROLE } : {}),
     ...(API_KEY ? { api_key: API_KEY } : {}),
+    ...(TIMEZONE ? { timezone: TIMEZONE } : {}),
   })
+  const tzWarn = (start as { timezone_warning?: unknown } | null)?.timezone_warning
+  if (tzWarn) debugLog(`bind: timezone_warning (${TIMEZONE}): ${JSON.stringify(tzWarn)}`)
   sessionId = (start as { session_id?: string } | null)?.session_id ?? null
   if (!sessionId) throw new Error('no session_id returned from memory_start_session')
   // v0.0.30: stash the whole onboarding response for attach_session. This is the

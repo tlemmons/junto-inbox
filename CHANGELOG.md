@@ -3,6 +3,26 @@
 All notable changes to junto-inbox are documented here. Versions before
 v0.0.14 shipped under the package name `cterm-inbox`.
 
+## v0.0.33
+
+Context self-report (`interface:context-self-report-v0`). The plugin now reports
+its own agent's context-window fill to junto-memory. The idle-park nudge and the
+learning context stamps then get a gauge on any OS, not only on Linux boxes that
+run the per-box reporter.
+
+- **statusline.ts** writes `<dir>/.claude/context-metrics.json` (fleet schema,
+  atomic temp+rename) to both `cwd` and `project_dir`. It does this only when it
+  is the configured Claude Code statusline, i.e. it receives a real payload on
+  stdin. A wrapper statusline that calls it with empty stdin owns the file.
+- **Heartbeat** (every 30 s): reads `context-metrics.json` from
+  `CLAUDE_PROJECT_DIR` (or the process cwd). It calls `memory_report_context`
+  for this agent only, and only when:
+  - `written_at` is newer than the last report and under 10 minutes old;
+  - the file's `agent` matches `JUNTO_AGENT`.
+  Failures go to the debug log only.
+- **Timezone:** bind passes `timezone=` (IANA zone from `Intl`;
+  `JUNTO_TIMEZONE` overrides) so the nudge's DAY/NIGHT verdict uses local time.
+
 ## v0.0.32
 
 API-key file source (security) — the plugin's shared-memory API key can now be

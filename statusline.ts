@@ -32,23 +32,86 @@
  * Exits 0 in all cases. Failures are silent so a missing file or unparseable
  * payload doesn't garble the user's status line.
  */
-import { readFileSync, statSync } from 'fs'
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
 const project = process.env.JUNTO_PROJECT
 const agent = process.env.JUNTO_AGENT
 
-// Claude Code pipes a JSON workspace blob on stdin. We don't need it, but
-// drain it so CC's stdin write doesn't backpressure.
+// Claude Code pipes a JSON workspace blob on stdin. Read it fully (this also
+// keeps CC's stdin write from backpressuring). Empty when a wrapper statusline
+// (e.g. ~/.claude/statusline.sh) invokes us with </dev/null — in that case the
+// wrapper owns context-metrics.json and we don't write it.
+let ccPayload: Record<string, any> | null = null
 try {
-  process.stdin.resume()
-  process.stdin.on('data', () => {})
-  process.stdin.on('end', () => {})
+  if (!process.stdin.isTTY) {
+    const raw = await Bun.stdin.text()
+    if (raw.trim() !== '') ccPayload = JSON.parse(raw)
+  }
 } catch {}
 
 if (!project || !agent) {
   process.exit(0)
+}
+
+// v0.0.33 — interface:context-self-report-v0: when we ARE the configured
+// statusline (real CC payload on stdin), publish <dir>/.claude/context-metrics.json
+// in the fleet schema that ~/.claude/statusline.sh also writes, so the plugin's
+// heartbeat can self-report context. Written to cwd AND project_dir (they differ
+// once the agent cd's; the plugin reads the launch dir). Atomic temp+rename.
+// Percentages derived from tokens (used_percentage is input-only and the
+// fleet schema's context_tokens is input+output). Never fails the statusline.
+function writeContextMetrics(p: Record<string, any>): void {
+  const cw = p.context_window
+  if (!cw || typeof cw !== 'object') return
+  const inTok = typeof cw.total_input_tokens === 'number' ? cw.total_input_tokens : 0
+  const outTok = typeof cw.total_output_tokens === 'number' ? cw.total_output_tokens : 0
+  const size = typeof cw.context_window_size === 'number' ? cw.context_window_size : 0
+  if (size <= 0) return
+  const used = inTok + outTok
+  const pct = Math.floor((used * 100) / size)
+  const cwd: string = p.workspace?.current_dir || p.cwd || process.cwd()
+  const pdir: string | undefined = p.workspace?.project_dir
+  const body = JSON.stringify(
+    {
+      ok: true,
+      written_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+      session_id: typeof p.session_id === 'string' ? p.session_id : '',
+      cwd,
+      agent,
+      context_tokens: used,
+      context_window: size,
+      context_pct: pct,
+      used_percentage: pct,
+      remaining_percentage: 100 - pct,
+      total_input_tokens: inTok,
+      total_output_tokens: outTok,
+      total_tokens: used,
+      used_tokens_k: Math.floor(used / 1000),
+      context_window_size: size,
+      context_window_size_k: Math.floor(size / 1000),
+      source: 'statusline.ts',
+    },
+    null,
+    2,
+  )
+  const dirs = new Set([cwd, ...(pdir ? [pdir] : [])])
+  for (const d of dirs) {
+    try {
+      const dir = join(d, '.claude')
+      mkdirSync(dir, { recursive: true })
+      const tmp = join(dir, `context-metrics.json.${process.pid}.tmp`)
+      writeFileSync(tmp, body)
+      renameSync(tmp, join(dir, 'context-metrics.json'))
+    } catch {}
+  }
+}
+
+if (ccPayload) {
+  try {
+    writeContextMetrics(ccPayload)
+  } catch {}
 }
 
 const file = join(homedir(), '.claude', 'junto-inbox', `${project}-${agent}.status`)
